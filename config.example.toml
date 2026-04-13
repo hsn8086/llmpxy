@@ -1,0 +1,66 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[route]
+type = "group"
+name = "default"
+
+[network]
+proxy = "http://127.0.0.1:7893"
+trust_env = false
+connect_timeout_seconds = 30.0
+read_timeout_seconds = 120.0
+write_timeout_seconds = 120.0
+pool_timeout_seconds = 30.0
+
+[proxy]
+strip_unsupported_fields = true
+log_level = "info"
+
+[retry]
+provider_error_threshold = 3
+base_backoff_seconds = 1.0
+max_backoff_seconds = 60.0
+max_rounds = 5
+
+[logging]
+dir = "./logs"
+info_file = "info.log"
+debug_file = "debug.log"
+rotation = "100 MB"
+retention = "10 days"
+
+[storage]
+backend = "sqlite"
+sqlite_path = "./data/llmpxy.db"
+file_dir = "./data/conversations"
+ttl_seconds = 604800
+
+[[providers]]
+name = "openai-chat-a"
+protocol = "oaichat"
+base_url = "https://provider-a.example.com/v1"
+api_key_env = "PROVIDER_A_API_KEY"
+timeout_seconds = 120.0
+model_whitelist_only = true
+
+[providers.models]
+"gpt-4.1" = "provider-a-chat-model"
+"gpt-4.1-mini" = "provider-a-chat-model-mini"
+
+[[providers]]
+name = "anthropic-a"
+protocol = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+timeout_seconds = 120.0
+anthropic_version = "2023-06-01"
+
+[providers.models]
+"claude-sonnet" = "claude-3-7-sonnet-latest"
+
+[[provider_groups]]
+name = "default"
+strategy = "fallback"
+members = ["openai-chat-a", "anthropic-a"]

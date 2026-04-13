@@ -1,0 +1,52 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[route]
+type = "group"
+name = "default"
+
+[proxy]
+strip_unsupported_fields = true
+log_level = "info"
+
+[retry]
+provider_error_threshold = 3
+base_backoff_seconds = 1.0
+max_backoff_seconds = 60.0
+max_rounds = 5
+
+[logging]
+dir = "./logs"
+info_file = "info.log"
+debug_file = "debug.log"
+rotation = "100 MB"
+retention = "10 days"
+
+[storage]
+backend = "sqlite"
+sqlite_path = "./data/gpt-trans.db"
+ttl_seconds = 604800
+
+[[providers]]
+name = "primary"
+base_url = "https://primary.example.com/v1"
+api_key_env = "PRIMARY_API_KEY"
+timeout_seconds = 120.0
+
+[providers.models]
+"gpt-4.1" = "primary-chat-model"
+
+[[providers]]
+name = "secondary"
+base_url = "https://secondary.example.com/v1"
+api_key_env = "SECONDARY_API_KEY"
+timeout_seconds = 120.0
+
+[providers.models]
+"gpt-4.1" = "secondary-chat-model"
+
+[[provider_groups]]
+name = "default"
+strategy = "fallback"
+members = ["primary", "secondary"]

@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from llmpxy.config import AppConfig, load_config
+
+
+def test_load_multi_protocol_config(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[route]
+type = "group"
+name = "default"
+
+[network]
+proxy = "http://127.0.0.1:7893"
+
+[storage]
+backend = "sqlite"
+sqlite_path = "./data/test.db"
+
+[[providers]]
+name = "openai-a"
+protocol = "oaichat"
+base_url = "https://a.example/v1"
+api_key_env = "A_KEY"
+
+[[providers]]
+name = "anthropic-a"
+protocol = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "B_KEY"
+
+[[provider_groups]]
+name = "default"
+strategy = "fallback"
+members = ["openai-a", "anthropic-a"]
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_file)
+    assert isinstance(config, AppConfig)
+    assert config.route.type == "group"
+    assert config.network.proxy == "http://127.0.0.1:7893"
+    assert config.providers[0].protocol == "oaichat"
+    assert config.providers[1].protocol == "anthropic"
+
+
+def test_duplicate_provider_names_rejected() -> None:
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(
+            {
+                "route": {"type": "provider", "name": "dup"},
+                "providers": [
+                    {
+                        "name": "dup",
+                        "protocol": "oaichat",
+                        "base_url": "https://a",
+                        "api_key_env": "A",
+                    },
+                    {
+                        "name": "dup",
+                        "protocol": "anthropic",
+                        "base_url": "https://b",
+                        "api_key_env": "B",
+                    },
+                ],
+            }
+        )
+
+
+def test_group_cycle_rejected() -> None:
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(
+            {
+                "route": {"type": "group", "name": "g1"},
+                "providers": [
+                    {
+                        "name": "a",
+                        "protocol": "oaichat",
+                        "base_url": "https://a",
+                        "api_key_env": "A",
+                    },
+                ],
+                "provider_groups": [
+                    {"name": "g1", "strategy": "fallback", "members": ["g2"]},
+                    {"name": "g2", "strategy": "fallback", "members": ["g1"]},
+                ],
+            }
+        )
+
+
+def test_provider_model_whitelist_only_requires_explicit_mapping() -> None:
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "openai-a"},
+            "providers": [
+                {
+                    "name": "openai-a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "model_whitelist_only": True,
+                    "models": {"gpt-4.1": "a-model"},
+                }
+            ],
+        }
+    )
+
+    provider = config.providers[0]
+    assert provider.supports_model("gpt-4.1") is True
+    assert provider.supports_model("gpt-4.1-mini") is False
+
+
+def test_load_config_reads_dotenv_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DOTENV_TEST_KEY", raising=False)
+
+    config_file = tmp_path / "config.toml"
+    dotenv_file = tmp_path / ".env"
+
+    dotenv_file.write_text('DOTENV_TEST_KEY="from-dotenv"\n', encoding="utf-8")
+    config_file.write_text(
+        """
+[route]
+type = "provider"
+name = "openai-a"
+
+[[providers]]
+name = "openai-a"
+protocol = "oaichat"
+base_url = "https://a.example/v1"
+api_key_env = "DOTENV_TEST_KEY"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_file)
+
+    assert config.providers[0].api_key() == "from-dotenv"

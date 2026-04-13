@@ -1,0 +1,80 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[route]
+type = "group"
+name = "global"
+
+[proxy]
+strip_unsupported_fields = true
+log_level = "info"
+
+[retry]
+provider_error_threshold = 3
+base_backoff_seconds = 1.0
+max_backoff_seconds = 60.0
+max_rounds = 5
+
+[logging]
+dir = "./logs"
+info_file = "info.log"
+debug_file = "debug.log"
+rotation = "100 MB"
+retention = "10 days"
+
+[storage]
+backend = "sqlite"
+sqlite_path = "./data/gpt-trans.db"
+ttl_seconds = 604800
+
+[[providers]]
+name = "cn-primary"
+base_url = "https://cn-primary.example.com/v1"
+api_key_env = "CN_PRIMARY_API_KEY"
+timeout_seconds = 120.0
+
+[providers.models]
+"gpt-4.1" = "cn-primary-model"
+
+[[providers]]
+name = "cn-backup"
+base_url = "https://cn-backup.example.com/v1"
+api_key_env = "CN_BACKUP_API_KEY"
+timeout_seconds = 120.0
+
+[providers.models]
+"gpt-4.1" = "cn-backup-model"
+
+[[providers]]
+name = "intl-a"
+base_url = "https://intl-a.example.com/v1"
+api_key_env = "INTL_A_API_KEY"
+timeout_seconds = 120.0
+
+[providers.models]
+"gpt-4.1" = "intl-a-model"
+
+[[providers]]
+name = "intl-b"
+base_url = "https://intl-b.example.com/v1"
+api_key_env = "INTL_B_API_KEY"
+timeout_seconds = 120.0
+
+[providers.models]
+"gpt-4.1" = "intl-b-model"
+
+[[provider_groups]]
+name = "cn"
+strategy = "fallback"
+members = ["cn-primary", "cn-backup"]
+
+[[provider_groups]]
+name = "intl"
+strategy = "load_balance"
+members = ["intl-a", "intl-b"]
+
+[[provider_groups]]
+name = "global"
+strategy = "load_balance"
+members = ["cn", "intl"]
