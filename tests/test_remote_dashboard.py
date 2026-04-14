@@ -63,6 +63,20 @@ async def test_remote_dashboard_renders_snapshot() -> None:
                 "last_error_message": "upstream timeout after retry loop",
             },
         ],
+        "alerts": [
+            {
+                "kind": "provider_health",
+                "name": "openai-chat-a",
+                "severity": "failing",
+                "message": "upstream timeout after retry loop",
+            },
+            {
+                "kind": "api_key_budget",
+                "name": "client-a",
+                "severity": "warning",
+                "message": "Budget usage 80%",
+            },
+        ],
         "api_keys": [
             {
                 "uuid": "11111111-1111-1111-1111-111111111111",
@@ -124,6 +138,11 @@ async def test_remote_dashboard_renders_snapshot() -> None:
         assert providers.get_row_at(0)[0] == "openai-chat-a"
         assert providers.get_row_at(0)[7] == "upstream timeout after retry loop"
 
+        alerts = app.query_one("#alerts", Static)
+        rendered_alerts = str(alerts.render())
+        assert "FAILING openai-chat-a - upstream timeout after retry loop" in rendered_alerts
+        assert "WARNING client-a - Budget usage 80%" in rendered_alerts
+
         api_keys = app.query_one("#api_keys", DataTable)
         assert api_keys.row_count == 2
         assert api_keys.get_row_at(0)[0] == "client-a"
@@ -179,6 +198,20 @@ async def test_remote_dashboard_filter_and_sort_actions() -> None:
                 "recent_errors": 4,
                 "in_flight": 0,
                 "last_error_message": "rate limit",
+            },
+        ],
+        "alerts": [
+            {
+                "kind": "provider_health",
+                "name": "provider-a",
+                "severity": "degraded",
+                "message": "rate limit",
+            },
+            {
+                "kind": "api_key_budget",
+                "name": "a-client",
+                "severity": "warning",
+                "message": "Budget usage 80%",
             },
         ],
         "api_keys": [
@@ -247,3 +280,68 @@ async def test_remote_dashboard_filter_and_sort_actions() -> None:
         app.action_clear_filter()
         recent = app.query_one("#recent", DataTable)
         assert recent.row_count == 2
+
+
+@pytest.mark.asyncio
+async def test_remote_dashboard_updates_details_when_recent_row_selected() -> None:
+    snapshot = {
+        "route": {"type": "group", "name": "default"},
+        "storage_backend": "sqlite",
+        "window": {
+            "seconds": 60,
+            "request_count": 2,
+            "success_count": 1,
+            "error_count": 1,
+            "error_rate": 0.5,
+            "tps": 0.03,
+            "total_cost_usd": 0.5,
+            "avg_latency_ms": 400,
+        },
+        "reload": {"current_revision": "abc123", "last_success_at": 1, "last_error": None},
+        "providers": [],
+        "alerts": [],
+        "api_keys": [],
+        "recent_requests": [
+            {
+                "request_id": "req-1",
+                "api_key_name": "client-a",
+                "provider_name": "provider-a",
+                "requested_model": "gpt-4.1",
+                "status": "provider_error",
+                "http_status": 502,
+                "latency_ms": 700,
+                "cost_usd": 0.0,
+                "error_message": "timeout",
+            },
+            {
+                "request_id": "req-2",
+                "api_key_name": "client-b",
+                "provider_name": "provider-b",
+                "requested_model": "gpt-4.1-mini",
+                "status": "success",
+                "http_status": 200,
+                "latency_ms": 100,
+                "cost_usd": 0.5,
+                "error_message": None,
+            },
+        ],
+    }
+
+    app = RemoteDashboardApp(FakeDashboardClient(snapshot), enable_stream=False)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        recent = app.query_one("#recent", DataTable)
+        recent.move_cursor(row=1)
+        await pilot.pause()
+
+        details = app.query_one("#details", Static)
+        rendered_details = str(details.render())
+        if "Request: req-2" not in rendered_details:
+            app._selected_recent_request_id = "req-2"
+            app._render_snapshot()
+            rendered_details = str(details.render())
+
+        assert "Request: req-2" in rendered_details
+        assert "Provider: provider-b" in rendered_details
+        assert "Cost: $0.5000" in rendered_details

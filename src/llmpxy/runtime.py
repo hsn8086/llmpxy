@@ -180,13 +180,15 @@ class RuntimeManager:
         if request_count > 0:
             error_rate = error_count / request_count
         provider_snapshots = []
+        provider_alerts: list[dict[str, object]] = []
         for provider in state.config.providers:
             provider_stats = self._stats.ensure_provider(provider.name)
+            provider_state = self._stats.provider_state(provider.name)
             provider_snapshots.append(
                 {
                     "name": provider.name,
                     "protocol": provider.protocol,
-                    "state": self._stats.provider_state(provider.name),
+                    "state": provider_state,
                     "consecutive_errors": provider_stats.consecutive_errors,
                     "last_success_at": provider_stats.last_success_at,
                     "last_error_at": provider_stats.last_error_at,
@@ -196,7 +198,17 @@ class RuntimeManager:
                     "recent_errors": provider_stats.recent_errors,
                 }
             )
+            if provider_state in {"failing", "degraded"}:
+                provider_alerts.append(
+                    {
+                        "kind": "provider_health",
+                        "name": provider.name,
+                        "severity": provider_state,
+                        "message": provider_stats.last_error_message or provider_state,
+                    }
+                )
         api_key_balances = []
+        api_key_alerts: list[dict[str, object]] = []
         for api_key in state.config.api_keys:
             used_usd = state.store.get_api_key_total_cost(api_key.uuid)
             remaining_usd = None
@@ -217,6 +229,26 @@ class RuntimeManager:
                     "utilization_ratio": utilization_ratio,
                 }
             )
+            if not api_key.enabled:
+                api_key_alerts.append(
+                    {
+                        "kind": "api_key_disabled",
+                        "name": api_key.name,
+                        "severity": "info",
+                        "message": "API key disabled",
+                    }
+                )
+            elif utilization_ratio is not None and utilization_ratio >= 0.8:
+                severity = "critical" if utilization_ratio >= 1.0 else "warning"
+                api_key_alerts.append(
+                    {
+                        "kind": "api_key_budget",
+                        "name": api_key.name,
+                        "severity": severity,
+                        "message": f"Budget usage {utilization_ratio * 100:.0f}%",
+                    }
+                )
+        alerts = provider_alerts + api_key_alerts
         return {
             "route": state.config.route.model_dump(mode="json"),
             "storage_backend": state.config.storage.backend,
@@ -239,6 +271,7 @@ class RuntimeManager:
             },
             "providers": provider_snapshots,
             "api_keys": api_key_balances,
+            "alerts": alerts,
             "recent_requests": [item.model_dump(mode="json") for item in recent_requests],
         }
 

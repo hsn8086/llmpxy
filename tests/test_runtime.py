@@ -291,9 +291,25 @@ api_key_env = "UPSTREAM_A_KEY"
             cost_usd=5.0,
         )
     )
+    state.store.put_api_key_usage(
+        ApiKeyUsageRecord(
+            api_key_uuid="11111111-1111-1111-1111-111111111111",
+            api_key_name="client-a",
+            request_id="usage-1",
+            provider_name="provider-a",
+            requested_model="gpt-4.1",
+            upstream_model="gpt-4.1",
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+            cost_usd=8.0,
+            created_at=now,
+        )
+    )
 
     snapshot = runtime.runtime_snapshot()
     window = snapshot["window"]
+    alerts = snapshot["alerts"]
 
     assert window == {
         "seconds": 60,
@@ -305,3 +321,11 @@ api_key_env = "UPSTREAM_A_KEY"
         "total_cost_usd": 1.0,
         "avg_latency_ms": 1000,
     }
+    assert alerts == [
+        {
+            "kind": "api_key_budget",
+            "name": "client-a",
+            "severity": "warning",
+            "message": "Budget usage 80%",
+        }
+    ]

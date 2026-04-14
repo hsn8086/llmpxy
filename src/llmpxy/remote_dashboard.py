@@ -74,6 +74,10 @@ class RemoteDashboardApp(App[None]):
         height: 8;
     }
 
+    #alerts {
+        height: 8;
+    }
+
     .panel-title {
         height: auto;
         padding: 0 1;
@@ -97,6 +101,7 @@ class RemoteDashboardApp(App[None]):
         self._filter_text = ""
         self._provider_sort_mode = "health"
         self._api_key_sort_mode = "usage"
+        self._selected_recent_request_id: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -112,6 +117,7 @@ class RemoteDashboardApp(App[None]):
                 Vertical(
                     Static("Providers", classes="panel-title"),
                     Static("Loading...", id="summary"),
+                    Static("No active alerts", id="alerts"),
                     DataTable(id="providers"),
                     id="left",
                 ),
@@ -129,6 +135,9 @@ class RemoteDashboardApp(App[None]):
         yield Footer()
 
     async def on_mount(self) -> None:
+        self.query_one("#providers", DataTable).cursor_type = "row"
+        self.query_one("#api_keys", DataTable).cursor_type = "row"
+        self.query_one("#recent", DataTable).cursor_type = "row"
         await self._load_snapshot()
         if self._enable_stream:
             self.run_worker(self._stream_events(), exclusive=True)
@@ -172,6 +181,7 @@ class RemoteDashboardApp(App[None]):
 
     def _render_snapshot(self) -> None:
         summary = self.query_one("#summary", Static)
+        alerts_widget = self.query_one("#alerts", Static)
         details = self.query_one("#details", Static)
         route = self._snapshot.get("route", {})
         reload = self._snapshot.get("reload", {})
@@ -206,6 +216,10 @@ class RemoteDashboardApp(App[None]):
                 ]
             )
         )
+        alerts = [
+            alert for alert in self._snapshot.get("alerts", []) if self._matches_filter(alert)
+        ]
+        alerts_widget.update(self._render_alerts(alerts))
 
         providers = self.query_one("#providers", DataTable)
         providers.clear(columns=True)
@@ -279,9 +293,54 @@ class RemoteDashboardApp(App[None]):
                 self._format_latency(item.get("latency_ms")),
                 f"{float(item.get('cost_usd', 0.0)):.4f}",
                 self._truncate(str(item.get("error_message") or item.get("error_code") or "-"), 40),
+                key=str(item.get("request_id", "-")),
             )
-        selected_request = filtered_recent_requests[0] if filtered_recent_requests else None
+        if filtered_recent_requests:
+            request_ids = {str(item.get("request_id", "-")) for item in filtered_recent_requests}
+            if self._selected_recent_request_id not in request_ids:
+                self._selected_recent_request_id = str(
+                    filtered_recent_requests[0].get("request_id", "-")
+                )
+        else:
+            self._selected_recent_request_id = None
+        selected_request = self._find_selected_request(filtered_recent_requests)
         details.update(self._render_request_details(selected_request))
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "recent":
+            return
+        row_key = event.row_key.value
+        if not isinstance(row_key, str):
+            return
+        self._selected_recent_request_id = row_key
+        recent_requests = list(self._snapshot.get("recent_requests", []))
+        filtered_recent_requests = [item for item in recent_requests if self._matches_filter(item)]
+        request = self._find_selected_request(filtered_recent_requests)
+        self.query_one("#details", Static).update(self._render_request_details(request))
+
+    def _find_selected_request(
+        self, recent_requests: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        if not recent_requests:
+            return None
+        if self._selected_recent_request_id is None:
+            return recent_requests[0]
+        for request in recent_requests:
+            if str(request.get("request_id", "-")) == self._selected_recent_request_id:
+                return request
+        return recent_requests[0]
+
+    def _render_alerts(self, alerts: list[dict[str, Any]]) -> str:
+        if not alerts:
+            return "No active alerts"
+        lines = []
+        for alert in alerts[:5]:
+            lines.append(
+                f"{str(alert.get('severity', '-')).upper()} {alert.get('name', '-')} - {alert.get('message', '-')}"
+            )
+        if len(alerts) > 5:
+            lines.append(f"... and {len(alerts) - 5} more alerts")
+        return "\n".join(lines)
 
     @staticmethod
     def _format_budget_value(value: object | None) -> str:
