@@ -335,7 +335,10 @@ class OpenAIResponsesAdapter:
             ],
             "phase": "final_answer",
         }
-        if message.reasoning_content is not None:
+        if (
+            message.reasoning_content is not None
+            and response.metadata.get("reasoning_summary") is not None
+        ):
             output_items.append(
                 {
                     "id": f"rs_{uuid.uuid4().hex}",

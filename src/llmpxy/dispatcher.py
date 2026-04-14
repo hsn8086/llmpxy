@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 
 from llmpxy.config import AppConfig, ProviderConfig, ProviderGroupConfig
-from llmpxy.logging_utils import bind_logger
+from llmpxy.logging_utils import bind_logger, sanitize_for_logging
 from llmpxy.models import CanonicalRequest, CanonicalResponse, CanonicalStreamEvent
 from llmpxy.protocols.registry import get_adapter
 from llmpxy.proxy_client import (
@@ -151,10 +151,36 @@ class ProviderDispatcher:
                 provider.base_url,
                 resolve_proxy(self._config, provider),
             )
+            log.debug(
+                "request canonical summary={} upstream payload summary={}",
+                sanitize_for_logging(
+                    {
+                        "protocol_in": request.protocol_in,
+                        "requested_model": request.requested_model,
+                        "reasoning": request.reasoning,
+                        "message_count": len(request.messages),
+                        "stream": request.stream,
+                    }
+                ),
+                sanitize_for_logging(
+                    {
+                        "path": path,
+                        "model": payload.get("model"),
+                        "reasoning": payload.get("reasoning"),
+                        "reasoning_effort": payload.get("reasoning_effort"),
+                        "stream": payload.get("stream"),
+                        "tool_choice": payload.get("tool_choice"),
+                    }
+                ),
+            )
             try:
                 async with create_async_client(self._config, provider) as client:
                     raw = await post_json(client, provider, path, payload)
                 response = adapter.parse_response(raw, provider.protocol)
+                reasoning = request.reasoning if isinstance(request.reasoning, dict) else None
+                reasoning_summary = reasoning.get("summary") if reasoning is not None else None
+                if isinstance(reasoning_summary, str):
+                    response.metadata["reasoning_summary"] = reasoning_summary
             except ProviderError as exc:
                 if not exc.retryable:
                     log.exception(
@@ -222,10 +248,36 @@ class ProviderDispatcher:
                 provider.base_url,
                 resolve_proxy(self._config, provider),
             )
+            log.debug(
+                "stream canonical summary={} upstream payload summary={}",
+                sanitize_for_logging(
+                    {
+                        "protocol_in": request.protocol_in,
+                        "requested_model": request.requested_model,
+                        "reasoning": request.reasoning,
+                        "message_count": len(request.messages),
+                        "stream": request.stream,
+                    }
+                ),
+                sanitize_for_logging(
+                    {
+                        "path": path,
+                        "model": payload.get("model"),
+                        "reasoning": payload.get("reasoning"),
+                        "reasoning_effort": payload.get("reasoning_effort"),
+                        "stream": payload.get("stream"),
+                        "tool_choice": payload.get("tool_choice"),
+                    }
+                ),
+            )
             try:
                 async with create_async_client(self._config, provider) as client:
                     lines = stream_lines(client, provider, path, payload)
                     response, events = await adapter.parse_stream(lines, provider.protocol)
+                reasoning = request.reasoning if isinstance(request.reasoning, dict) else None
+                reasoning_summary = reasoning.get("summary") if reasoning is not None else None
+                if isinstance(reasoning_summary, str):
+                    response.metadata["reasoning_summary"] = reasoning_summary
             except ProviderError as exc:
                 if not exc.retryable:
                     log.exception(
