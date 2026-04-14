@@ -31,6 +31,9 @@ uv sync
 export PROVIDER_A_API_KEY="your-key"
 export ANTHROPIC_API_KEY="your-key"
 uv run llmpxy serve --config ./config.toml
+
+# 开发时可开启自动重载
+uv run llmpxy serve --config ./config.toml --reload
 ```
 
 也可以把这些密钥写到 `.env` 文件中，`llmpxy` 会默认读取当前工作目录或配置文件同目录下的 `.env`。
