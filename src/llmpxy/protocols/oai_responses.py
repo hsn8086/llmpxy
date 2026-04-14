@@ -774,8 +774,20 @@ def _normalize_input(value: Any) -> list[CanonicalMessage]:
     if not isinstance(value, list):
         raise HTTPException(status_code=400, detail="input must be a string or list")
     messages: list[CanonicalMessage] = []
+
+    def flush_pending_tool_calls() -> None:
+        nonlocal pending_tool_calls
+        if not pending_tool_calls:
+            return
+        messages.append(
+            CanonicalMessage(role="assistant", content=[], tool_calls=pending_tool_calls)
+        )
+        pending_tool_calls = []
+
+    pending_tool_calls: list[CanonicalToolCall] = []
     for item in value:
         if isinstance(item, str):
+            flush_pending_tool_calls()
             messages.append(
                 CanonicalMessage(
                     role="user", content=[CanonicalContentPart(type="text", text=item)]
@@ -800,18 +812,12 @@ def _normalize_input(value: Any) -> list[CanonicalMessage]:
                     detail="function_call.name is required",
                 )
             arguments = item.get("arguments")
-            messages.append(
-                CanonicalMessage(
-                    role="assistant",
-                    content=[],
-                    tool_calls=[
-                        CanonicalToolCall(
-                            id=call_id,
-                            type="function",
-                            name=name,
-                            arguments=arguments if isinstance(arguments, str) else "",
-                        )
-                    ],
+            pending_tool_calls.append(
+                CanonicalToolCall(
+                    id=call_id,
+                    type="function",
+                    name=name,
+                    arguments=arguments if isinstance(arguments, str) else "",
                 )
             )
             continue
@@ -823,6 +829,7 @@ def _normalize_input(value: Any) -> list[CanonicalMessage]:
                     status_code=400,
                     detail="function_call_output.call_id is required",
                 )
+            flush_pending_tool_calls()
             messages.append(
                 CanonicalMessage(
                     role="tool",
@@ -843,7 +850,8 @@ def _normalize_input(value: Any) -> list[CanonicalMessage]:
             else "user"
         )
         content = item.get("content")
-        tool_calls = _normalize_output_tool_calls(item)
+        tool_calls = [*pending_tool_calls, *_normalize_output_tool_calls(item)]
+        pending_tool_calls = []
         if content is None:
             messages.append(CanonicalMessage(role=role, content=[], tool_calls=tool_calls))
             continue
@@ -875,6 +883,7 @@ def _normalize_input(value: Any) -> list[CanonicalMessage]:
             )
             continue
         raise HTTPException(status_code=400, detail="input content must be a string or list")
+    flush_pending_tool_calls()
     return messages
 
 
