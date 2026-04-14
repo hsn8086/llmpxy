@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 import uuid
@@ -622,11 +623,13 @@ def _can_bridge_live_stream(
 ) -> bool:
     if not providers:
         return False
-    return (
-        inbound_protocol == "oairesp"
-        and all(provider.protocol == providers[0].protocol for provider in providers)
-        and providers[0].protocol in {"oaichat", "anthropic"}
-    )
+    if not all(provider.protocol == providers[0].protocol for provider in providers):
+        return False
+    if inbound_protocol == "oairesp":
+        return providers[0].protocol in {"oaichat", "anthropic"}
+    if inbound_protocol == "oaichat":
+        return providers[0].protocol == "anthropic"
+    return False
 
 
 async def _live_stream_passthrough(
@@ -925,6 +928,97 @@ async def _live_stream_bridge_anthropic_to_oairesp(
     )
 
 
+async def _live_stream_bridge_anthropic_to_oaichat(
+    *,
+    request_id: str,
+    canonical_request: Any,
+    provider: ProviderConfig,
+    adapter: Any,
+    runtime: RuntimeManager | None,
+    api_key: AuthenticatedApiKey | None,
+    store: ConversationStore,
+    config: AppConfig,
+    started_perf: float,
+    first_line: str,
+    client: Any,
+    response: Any,
+    line_iterator: AsyncIterator[str],
+) -> AsyncIterator[str]:
+    anthropic_state = init_anthropic_stream_state(provider.protocol)
+    first_events = process_anthropic_stream_line(anthropic_state, first_line)
+    try:
+        response_id = anthropic_state.response_id
+        created_at = int(time.time())
+        model = anthropic_state.model
+        for event in first_events:
+            if event.event_type != "text_delta" or event.delta is None:
+                continue
+            chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created_at,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": event.delta}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+        async for line in line_iterator:
+            if not line:
+                continue
+            events = process_anthropic_stream_line(anthropic_state, line)
+            model = anthropic_state.model or model
+            for event in events:
+                if event.event_type != "text_delta" or event.delta is None:
+                    continue
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_at,
+                    "model": model,
+                    "choices": [
+                        {"index": 0, "delta": {"content": event.delta}, "finish_reason": None}
+                    ],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+    finally:
+        await response.aclose()
+        await client.aclose()
+
+    final_response, final_events = build_anthropic_stream_result(anthropic_state)
+    final_response.protocol_out = "oaichat"
+    final_chunk = {
+        "id": final_response.response_id,
+        "object": "chat.completion.chunk",
+        "created": final_response.created_at,
+        "model": final_response.model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": final_response.usage.input_tokens,
+            "completion_tokens": final_response.usage.output_tokens,
+            "total_tokens": final_response.usage.total_tokens,
+        },
+    }
+    yield f"data: {json.dumps(final_chunk)}\n\n"
+    yield "data: [DONE]\n\n"
+    if runtime is not None and api_key is not None:
+        runtime.record_usage(
+            api_key=api_key,
+            request_id=request_id,
+            request=canonical_request,
+            response=final_response,
+            provider_name=provider.name,
+            latency_ms=int((time.perf_counter() - started_perf) * 1000),
+        )
+        await runtime.publish_request_event(
+            {
+                "request_id": request_id,
+                "api_key": api_key.name,
+                "provider": provider.name,
+                "model": canonical_request.requested_model,
+                "status": "success",
+            }
+        )
+
+
 async def _prepare_live_stream_bridge(
     *,
     inbound_protocol: ProtocolName,
@@ -980,6 +1074,22 @@ async def _prepare_live_stream_bridge(
                 )
             if inbound_protocol == "oairesp" and provider.protocol == "anthropic":
                 return _live_stream_bridge_anthropic_to_oairesp(
+                    request_id=request_id,
+                    canonical_request=canonical_request,
+                    provider=provider,
+                    adapter=adapter,
+                    runtime=runtime,
+                    api_key=api_key,
+                    store=store,
+                    config=config,
+                    started_perf=started_perf,
+                    first_line=first_line,
+                    client=client,
+                    response=response,
+                    line_iterator=line_iterator,
+                )
+            if inbound_protocol == "oaichat" and provider.protocol == "anthropic":
+                return _live_stream_bridge_anthropic_to_oaichat(
                     request_id=request_id,
                     canonical_request=canonical_request,
                     provider=provider,
