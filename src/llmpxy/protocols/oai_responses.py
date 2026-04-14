@@ -843,23 +843,36 @@ def _normalize_input(value: Any) -> list[CanonicalMessage]:
             else "user"
         )
         content = item.get("content")
+        tool_calls = _normalize_output_tool_calls(item)
         if content is None:
-            messages.append(CanonicalMessage(role=role, content=[]))
+            messages.append(CanonicalMessage(role=role, content=[], tool_calls=tool_calls))
             continue
         if isinstance(content, str):
             messages.append(
                 CanonicalMessage(
-                    role=role, content=[CanonicalContentPart(type="text", text=content)]
+                    role=role,
+                    content=[CanonicalContentPart(type="text", text=content)],
+                    tool_calls=tool_calls,
                 )
             )
             continue
         if isinstance(content, dict):
             messages.append(
-                CanonicalMessage(role=role, content=_normalize_output_content([content]))
+                CanonicalMessage(
+                    role=role,
+                    content=_normalize_output_content([content]),
+                    tool_calls=tool_calls,
+                )
             )
             continue
         if isinstance(content, list):
-            messages.append(CanonicalMessage(role=role, content=_normalize_output_content(content)))
+            messages.append(
+                CanonicalMessage(
+                    role=role,
+                    content=_normalize_output_content(content),
+                    tool_calls=tool_calls,
+                )
+            )
             continue
         raise HTTPException(status_code=400, detail="input content must be a string or list")
     return messages
