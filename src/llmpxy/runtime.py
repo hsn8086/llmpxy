@@ -275,6 +275,9 @@ class RuntimeManager:
         total_cached_input_tokens = sum(item.cached_input_tokens or 0 for item in window_requests)
         total_output_tokens = sum(item.output_tokens or 0 for item in window_requests)
         total_tokens = sum(item.total_tokens or 0 for item in window_requests)
+        cache_hit_rate = 0.0
+        if total_input_tokens > 0:
+            cache_hit_rate = min(max(total_cached_input_tokens / total_input_tokens, 0.0), 1.0)
         latency_values = [
             item.latency_ms for item in window_requests if item.latency_ms is not None
         ]
@@ -296,7 +299,8 @@ class RuntimeManager:
             "rps": request_count / seconds,
             "success_rps": success_count / seconds,
             "error_rps": error_count / seconds,
-            "tokens_per_second": total_tokens / seconds,
+            "tokens_per_second": total_output_tokens / seconds,
+            "cache_hit_rate": cache_hit_rate,
             "total_cost_usd": total_cost_usd,
             "avg_latency_ms": avg_latency_ms,
             "p95_latency_ms": p95_latency_ms,
@@ -323,6 +327,9 @@ class RuntimeManager:
         total_input_tokens = sum(item.input_tokens or 0 for item in requests)
         total_cached_input_tokens = sum(item.cached_input_tokens or 0 for item in requests)
         total_output_tokens = sum(item.output_tokens or 0 for item in requests)
+        cache_hit_rate = 0.0
+        if total_input_tokens > 0:
+            cache_hit_rate = min(max(total_cached_input_tokens / total_input_tokens, 0.0), 1.0)
         if latency_values:
             avg_latency_ms = int(sum(latency_values) / len(latency_values))
         error_rate = 0.0
@@ -335,7 +342,8 @@ class RuntimeManager:
             "error_count": error_count,
             "error_rate": error_rate,
             "rps": request_count / seconds,
-            "tokens_per_second": (sum(item.total_tokens or 0 for item in requests) / seconds),
+            "tokens_per_second": total_output_tokens / seconds,
+            "cache_hit_rate": cache_hit_rate,
             "avg_latency_ms": avg_latency_ms,
             "total_input_tokens": total_input_tokens,
             "total_cached_input_tokens": total_cached_input_tokens,

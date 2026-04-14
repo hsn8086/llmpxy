@@ -62,7 +62,8 @@ async def test_remote_dashboard_renders_snapshot() -> None:
             "rps": 0.03,
             "success_rps": 0.02,
             "error_rps": 0.01,
-            "tokens_per_second": 50.0,
+            "tokens_per_second": 2.5,
+            "cache_hit_rate": 0.25,
             "total_cost_usd": 0.5,
             "avg_latency_ms": 1210,
             "p95_latency_ms": 2100,
@@ -77,7 +78,8 @@ async def test_remote_dashboard_renders_snapshot() -> None:
                 "rps": 0.10,
                 "success_rps": 0.0,
                 "error_rps": 0.10,
-                "tokens_per_second": 100.0,
+                "tokens_per_second": 0.0,
+                "cache_hit_rate": 0.10,
                 "total_cost_usd": 0.0,
                 "avg_latency_ms": 2100,
                 "p95_latency_ms": 2100,
@@ -91,7 +93,8 @@ async def test_remote_dashboard_renders_snapshot() -> None:
                 "rps": 0.03,
                 "success_rps": 0.02,
                 "error_rps": 0.01,
-                "tokens_per_second": 50.0,
+                "tokens_per_second": 2.5,
+                "cache_hit_rate": 0.25,
                 "total_cost_usd": 0.5,
                 "avg_latency_ms": 1210,
                 "p95_latency_ms": 2100,
@@ -105,7 +108,8 @@ async def test_remote_dashboard_renders_snapshot() -> None:
                 "rps": 0.02,
                 "success_rps": 0.02,
                 "error_rps": 0.00,
-                "tokens_per_second": 30.0,
+                "tokens_per_second": 4.0,
+                "cache_hit_rate": 0.20,
                 "total_cost_usd": 2.5,
                 "avg_latency_ms": 900,
                 "p95_latency_ms": 2100,
@@ -134,7 +138,8 @@ async def test_remote_dashboard_renders_snapshot() -> None:
                     "error_count": 0,
                     "error_rate": 0.0,
                     "rps": 0.02,
-                    "tokens_per_second": 22.5,
+                    "tokens_per_second": 2.5,
+                    "cache_hit_rate": 0.25,
                     "avg_latency_ms": 320,
                     "total_input_tokens": 1200,
                     "total_cached_input_tokens": 300,
@@ -159,6 +164,7 @@ async def test_remote_dashboard_renders_snapshot() -> None:
                     "error_rate": 1.0,
                     "rps": 0.02,
                     "tokens_per_second": 0.0,
+                    "cache_hit_rate": 0.0,
                     "avg_latency_ms": 2100,
                     "total_input_tokens": 0,
                     "total_cached_input_tokens": 0,
@@ -245,11 +251,11 @@ async def test_remote_dashboard_renders_snapshot() -> None:
         rendered_summary = str(summary.render())
         assert "Filter: -  ProviderSort: health  KeySort: usage" in rendered_summary
         assert (
-            "Window(60s): req=2 rps=0.03 tok/s=50.00 err_rate=50.0% avg_latency=1210ms"
+            "Window(60s): req=2 rps=0.03 tok/s=2.50 cache_hit=25.0% err_rate=50.0% avg_latency=1210ms"
             in rendered_summary
         )
         assert "Window(10s): rps=0.10 success_rps=0.00 error_rps=0.10" in rendered_summary
-        assert "Window(5m): req=6 p95=2100ms tok/s=30.00 tokens=9000 cost=$2.50" in rendered_summary
+        assert "Window(5m): req=6 p95=2100ms tok/s=4.00 tokens=9000 cost=$2.50" in rendered_summary
         assert "Providers: total=2 healthy=1 failing=1" in rendered_summary
         assert "Recent Requests: total=2 success=1 errors=1 cost=$0.5000" in rendered_summary
 
@@ -262,7 +268,10 @@ async def test_remote_dashboard_renders_snapshot() -> None:
         rendered_provider_details = str(provider_details.render())
         assert "Provider: openai-chat-a" in rendered_provider_details
         assert "State: failing" in rendered_provider_details
-        assert "Window(60s): req=1 rps=0.02 tok/s=0.00 err_rate=100.0%" in rendered_provider_details
+        assert (
+            "Window(60s): req=1 rps=0.02 tok/s=0.00 cache_hit=0.0% err_rate=100.0%"
+            in rendered_provider_details
+        )
         assert "Window(60s): avg_latency=2100ms cost=$0.0000" in rendered_provider_details
         assert "Window(60s): in=0 cached=0 out=0" in rendered_provider_details
         assert provider_details.has_class("state-bad")
@@ -316,7 +325,7 @@ async def test_remote_dashboard_filter_and_sort_actions() -> None:
             "rps": 0.05,
             "success_rps": 0.03,
             "error_rps": 0.02,
-            "tokens_per_second": 40.0,
+            "tokens_per_second": 0.5,
             "total_cost_usd": 1.5,
             "avg_latency_ms": 500,
             "p95_latency_ms": 900,
@@ -331,7 +340,7 @@ async def test_remote_dashboard_filter_and_sort_actions() -> None:
                 "rps": 0.10,
                 "success_rps": 0.0,
                 "error_rps": 0.10,
-                "tokens_per_second": 10.0,
+                "tokens_per_second": 0.0,
                 "total_cost_usd": 0.0,
                 "avg_latency_ms": 900,
                 "p95_latency_ms": 900,
@@ -345,7 +354,7 @@ async def test_remote_dashboard_filter_and_sort_actions() -> None:
                 "rps": 0.05,
                 "success_rps": 0.03,
                 "error_rps": 0.02,
-                "tokens_per_second": 40.0,
+                "tokens_per_second": 0.5,
                 "total_cost_usd": 1.5,
                 "avg_latency_ms": 500,
                 "p95_latency_ms": 900,
@@ -359,7 +368,7 @@ async def test_remote_dashboard_filter_and_sort_actions() -> None:
                 "rps": 0.03,
                 "success_rps": 0.03,
                 "error_rps": 0.00,
-                "tokens_per_second": 13.33,
+                "tokens_per_second": 1.33,
                 "total_cost_usd": 4.0,
                 "avg_latency_ms": 450,
                 "p95_latency_ms": 900,
@@ -384,7 +393,7 @@ async def test_remote_dashboard_filter_and_sort_actions() -> None:
                     "error_count": 0,
                     "error_rate": 0.0,
                     "rps": 0.02,
-                    "tokens_per_second": 1.83,
+                    "tokens_per_second": 0.17,
                     "avg_latency_ms": 100,
                     "total_input_tokens": 100,
                     "total_cached_input_tokens": 20,
@@ -408,7 +417,7 @@ async def test_remote_dashboard_filter_and_sort_actions() -> None:
                     "error_count": 1,
                     "error_rate": 0.5,
                     "rps": 0.03,
-                    "tokens_per_second": 3.83,
+                    "tokens_per_second": 0.50,
                     "avg_latency_ms": 500,
                     "total_input_tokens": 200,
                     "total_cached_input_tokens": 40,
@@ -513,7 +522,7 @@ async def test_remote_dashboard_updates_provider_and_api_key_details_when_rows_s
             "rps": 0.03,
             "success_rps": 0.02,
             "error_rps": 0.01,
-            "tokens_per_second": 33.33,
+            "tokens_per_second": 0.83,
             "total_cost_usd": 0.5,
             "avg_latency_ms": 400,
             "p95_latency_ms": 700,
@@ -528,7 +537,7 @@ async def test_remote_dashboard_updates_provider_and_api_key_details_when_rows_s
                 "rps": 0.10,
                 "success_rps": 0.10,
                 "error_rps": 0.0,
-                "tokens_per_second": 100.0,
+                "tokens_per_second": 1.00,
                 "total_cost_usd": 0.5,
                 "avg_latency_ms": 100,
                 "p95_latency_ms": 100,
@@ -542,7 +551,7 @@ async def test_remote_dashboard_updates_provider_and_api_key_details_when_rows_s
                 "rps": 0.03,
                 "success_rps": 0.02,
                 "error_rps": 0.01,
-                "tokens_per_second": 33.33,
+                "tokens_per_second": 0.83,
                 "total_cost_usd": 0.5,
                 "avg_latency_ms": 400,
                 "p95_latency_ms": 700,
@@ -556,7 +565,7 @@ async def test_remote_dashboard_updates_provider_and_api_key_details_when_rows_s
                 "rps": 0.01,
                 "success_rps": 0.01,
                 "error_rps": 0.00,
-                "tokens_per_second": 13.33,
+                "tokens_per_second": 0.67,
                 "total_cost_usd": 1.0,
                 "avg_latency_ms": 350,
                 "p95_latency_ms": 700,
@@ -582,7 +591,7 @@ async def test_remote_dashboard_updates_provider_and_api_key_details_when_rows_s
                     "error_count": 1,
                     "error_rate": 1.0,
                     "rps": 0.02,
-                    "tokens_per_second": 0.92,
+                    "tokens_per_second": 0.08,
                     "avg_latency_ms": 700,
                     "total_input_tokens": 50,
                     "total_cached_input_tokens": 10,
@@ -607,7 +616,7 @@ async def test_remote_dashboard_updates_provider_and_api_key_details_when_rows_s
                     "error_count": 0,
                     "error_rate": 0.0,
                     "rps": 0.02,
-                    "tokens_per_second": 1.58,
+                    "tokens_per_second": 0.25,
                     "avg_latency_ms": 100,
                     "total_input_tokens": 80,
                     "total_cached_input_tokens": 20,
@@ -689,7 +698,7 @@ async def test_remote_dashboard_updates_details_when_recent_row_selected() -> No
             "rps": 0.03,
             "success_rps": 0.02,
             "error_rps": 0.01,
-            "tokens_per_second": 33.33,
+            "tokens_per_second": 0.83,
             "total_cost_usd": 0.5,
             "avg_latency_ms": 400,
             "p95_latency_ms": 700,
@@ -704,7 +713,7 @@ async def test_remote_dashboard_updates_details_when_recent_row_selected() -> No
                 "rps": 0.10,
                 "success_rps": 0.10,
                 "error_rps": 0.0,
-                "tokens_per_second": 100.0,
+                "tokens_per_second": 1.50,
                 "total_cost_usd": 0.5,
                 "avg_latency_ms": 100,
                 "p95_latency_ms": 100,
@@ -718,7 +727,7 @@ async def test_remote_dashboard_updates_details_when_recent_row_selected() -> No
                 "rps": 0.03,
                 "success_rps": 0.02,
                 "error_rps": 0.01,
-                "tokens_per_second": 33.33,
+                "tokens_per_second": 0.83,
                 "total_cost_usd": 0.5,
                 "avg_latency_ms": 400,
                 "p95_latency_ms": 700,
@@ -732,7 +741,7 @@ async def test_remote_dashboard_updates_details_when_recent_row_selected() -> No
                 "rps": 0.01,
                 "success_rps": 0.01,
                 "error_rps": 0.00,
-                "tokens_per_second": 13.33,
+                "tokens_per_second": 0.67,
                 "total_cost_usd": 1.0,
                 "avg_latency_ms": 350,
                 "p95_latency_ms": 700,
