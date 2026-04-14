@@ -76,6 +76,50 @@ def _build_target_url(provider: ProviderConfig, path: str) -> str:
     return f"{base_url}{normalized_path}"
 
 
+async def open_stream(
+    client: httpx.AsyncClient,
+    provider: ProviderConfig,
+    path: str,
+    payload: dict[str, Any],
+) -> httpx.Response:
+    target_url = _build_target_url(provider, path)
+    proxy = getattr(client, "_proxy", None)
+    try:
+        response = await client.send(
+            client.build_request(
+                "POST",
+                target_url,
+                headers=build_headers(provider),
+                json=payload,
+            ),
+            stream=True,
+        )
+    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        raise ProviderError(
+            str(exc),
+            retryable=True,
+            base_url=provider.base_url,
+            proxy=str(proxy) if proxy is not None else None,
+            path=path,
+        ) from exc
+    if response.status_code >= 400:
+        body = await response.aread()
+        await response.aclose()
+        response_text = body.decode("utf-8")
+        retryable, error_code = _classify_error_response(response.status_code, response_text)
+        raise ProviderError(
+            f"Provider {provider.name} returned HTTP {response.status_code}",
+            retryable=retryable,
+            status_code=response.status_code,
+            response_text=response_text,
+            error_code=error_code,
+            base_url=provider.base_url,
+            proxy=str(proxy) if proxy is not None else None,
+            path=path,
+        )
+    return response
+
+
 async def post_json(
     client: httpx.AsyncClient,
     provider: ProviderConfig,
@@ -135,49 +179,19 @@ async def stream_lines(
     payload: dict[str, Any],
 ) -> AsyncIterator[str]:
     target_url = _build_target_url(provider, path)
-    proxy = getattr(client, "_proxy", None)
+    response = await open_stream(client, provider, path, payload)
     try:
-        async with client.stream(
-            "POST",
-            target_url,
-            headers=build_headers(provider),
-            json=payload,
-            timeout=provider.timeout_seconds,
-        ) as response:
-            if response.status_code >= 400:
-                body = await response.aread()
-                response_text = body.decode("utf-8")
-                retryable, error_code = _classify_error_response(
-                    response.status_code,
-                    response_text,
+        async for line in response.aiter_lines():
+            if line:
+                logger.bind(request_id="-", provider=provider.name, round=0, attempt=0).debug(
+                    "upstream stream line host={} path={} line={}",
+                    urlparse(target_url).netloc,
+                    path,
+                    line,
                 )
-                raise ProviderError(
-                    f"Provider {provider.name} returned HTTP {response.status_code}",
-                    retryable=retryable,
-                    status_code=response.status_code,
-                    response_text=response_text,
-                    error_code=error_code,
-                    base_url=provider.base_url,
-                    proxy=str(proxy) if proxy is not None else None,
-                    path=path,
-                )
-            async for line in response.aiter_lines():
-                if line:
-                    logger.bind(request_id="-", provider=provider.name, round=0, attempt=0).debug(
-                        "upstream stream line host={} path={} line={}",
-                        urlparse(target_url).netloc,
-                        path,
-                        line,
-                    )
-                    yield line
-    except (httpx.TimeoutException, httpx.NetworkError) as exc:
-        raise ProviderError(
-            str(exc),
-            retryable=True,
-            base_url=provider.base_url,
-            proxy=str(proxy) if proxy is not None else None,
-            path=path,
-        ) from exc
+                yield line
+    finally:
+        await response.aclose()
 
 
 def _is_retryable_status(status_code: int) -> bool:

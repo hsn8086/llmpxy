@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 import time
 import uuid
@@ -152,80 +153,10 @@ class OpenAIChatAdapter:
         lines: AsyncIterator[str],
         protocol_out: str,
     ) -> tuple[CanonicalResponse, list[CanonicalStreamEvent]]:
-        response_id = f"chatcmpl_{uuid.uuid4().hex}"
-        item_id = f"msg_{uuid.uuid4().hex}"
-        model = ""
-        text_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        active_tool_calls_by_index: dict[int, CanonicalToolCall] = {}
-        tool_calls: list[CanonicalToolCall] = []
-        usage = CanonicalUsage()
-        events: list[CanonicalStreamEvent] = []
-
+        state = init_chat_stream_state(protocol_out)
         async for line in lines:
-            if not line.startswith("data: "):
-                continue
-            raw = line[6:]
-            if raw == "[DONE]":
-                break
-            payload = json.loads(raw)
-            if isinstance(payload.get("model"), str):
-                model = payload["model"]
-            if isinstance(payload.get("usage"), dict):
-                usage = CanonicalUsage(
-                    input_tokens=int(payload["usage"].get("prompt_tokens", usage.input_tokens)),
-                    cached_input_tokens=int(
-                        payload["usage"]
-                        .get("prompt_tokens_details", {})
-                        .get("cached_tokens", usage.cached_input_tokens)
-                    ),
-                    output_tokens=int(
-                        payload["usage"].get("completion_tokens", usage.output_tokens)
-                    ),
-                    total_tokens=int(payload["usage"].get("total_tokens", usage.total_tokens)),
-                )
-            choice = (payload.get("choices") or [{}])[0]
-            delta = choice.get("delta", {})
-            for text in _extract_delta_texts(delta.get("content")):
-                text_parts.append(text)
-                events.append(
-                    CanonicalStreamEvent(
-                        event_type="text_delta",
-                        response_id=response_id,
-                        item_id=item_id,
-                        delta=text,
-                    )
-                )
-            for text in _extract_reasoning_texts(delta):
-                reasoning_parts.append(text)
-            for event in _extract_tool_call_events(
-                delta.get("tool_calls"),
-                active_tool_calls_by_index,
-                tool_calls,
-            ):
-                events.append(event)
-
-            message = choice.get("message")
-            if isinstance(message, dict):
-                for text in _extract_reasoning_texts(message):
-                    reasoning_parts.append(text)
-
-        response = CanonicalResponse(
-            response_id=response_id,
-            protocol_out=_normalize_protocol(protocol_out, "oaichat"),
-            model=model,
-            created_at=int(time.time()),
-            output_messages=[
-                CanonicalMessage(
-                    role="assistant",
-                    content=[CanonicalContentPart(type="text", text="".join(text_parts))],
-                    tool_calls=tool_calls,
-                    reasoning_content="".join(reasoning_parts) or None,
-                )
-            ],
-            usage=usage,
-        )
-        return response, events
+            process_chat_stream_line(state, line)
+        return build_chat_stream_result(state)
 
     def format_response(self, response: CanonicalResponse) -> dict[str, Any]:
         message = (
@@ -631,3 +562,93 @@ def _extract_tool_call_events(
                 )
 
     return events
+
+
+@dataclass
+class ChatStreamState:
+    protocol_out: str
+    response_id: str = field(default_factory=lambda: f"chatcmpl_{uuid.uuid4().hex}")
+    item_id: str = field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
+    model: str = ""
+    text_parts: list[str] = field(default_factory=list)
+    reasoning_parts: list[str] = field(default_factory=list)
+    active_tool_calls_by_index: dict[int, CanonicalToolCall] = field(default_factory=dict)
+    tool_calls: list[CanonicalToolCall] = field(default_factory=list)
+    usage: CanonicalUsage = field(default_factory=CanonicalUsage)
+    events: list[CanonicalStreamEvent] = field(default_factory=list)
+
+
+def init_chat_stream_state(protocol_out: str) -> ChatStreamState:
+    return ChatStreamState(protocol_out=protocol_out)
+
+
+def process_chat_stream_line(state: ChatStreamState, line: str) -> list[CanonicalStreamEvent]:
+    if not line.startswith("data: "):
+        return []
+    raw = line[6:]
+    if raw == "[DONE]":
+        return []
+    payload = json.loads(raw)
+    emitted: list[CanonicalStreamEvent] = []
+    if isinstance(payload.get("model"), str):
+        state.model = payload["model"]
+    if isinstance(payload.get("usage"), dict):
+        state.usage = CanonicalUsage(
+            input_tokens=int(payload["usage"].get("prompt_tokens", state.usage.input_tokens)),
+            cached_input_tokens=int(
+                payload["usage"]
+                .get("prompt_tokens_details", {})
+                .get("cached_tokens", state.usage.cached_input_tokens)
+            ),
+            output_tokens=int(payload["usage"].get("completion_tokens", state.usage.output_tokens)),
+            total_tokens=int(payload["usage"].get("total_tokens", state.usage.total_tokens)),
+        )
+    choice = (payload.get("choices") or [{}])[0]
+    delta = choice.get("delta", {})
+    for text in _extract_delta_texts(delta.get("content")):
+        state.text_parts.append(text)
+        event = CanonicalStreamEvent(
+            event_type="text_delta",
+            response_id=state.response_id,
+            item_id=state.item_id,
+            delta=text,
+        )
+        state.events.append(event)
+        emitted.append(event)
+    for text in _extract_reasoning_texts(delta):
+        state.reasoning_parts.append(text)
+    for event in _extract_tool_call_events(
+        delta.get("tool_calls"),
+        state.active_tool_calls_by_index,
+        state.tool_calls,
+    ):
+        event.response_id = state.response_id
+        state.events.append(event)
+        emitted.append(event)
+
+    message = choice.get("message")
+    if isinstance(message, dict):
+        for text in _extract_reasoning_texts(message):
+            state.reasoning_parts.append(text)
+    return emitted
+
+
+def build_chat_stream_result(
+    state: ChatStreamState,
+) -> tuple[CanonicalResponse, list[CanonicalStreamEvent]]:
+    response = CanonicalResponse(
+        response_id=state.response_id,
+        protocol_out=_normalize_protocol(state.protocol_out, "oaichat"),
+        model=state.model,
+        created_at=int(time.time()),
+        output_messages=[
+            CanonicalMessage(
+                role="assistant",
+                content=[CanonicalContentPart(type="text", text="".join(state.text_parts))],
+                tool_calls=state.tool_calls,
+                reasoning_content="".join(state.reasoning_parts) or None,
+            )
+        ],
+        usage=state.usage,
+    )
+    return response, state.events

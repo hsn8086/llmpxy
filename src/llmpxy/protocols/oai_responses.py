@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 import time
 import uuid
@@ -384,177 +385,263 @@ class OpenAIResponsesAdapter:
         response: CanonicalResponse,
         events: list[CanonicalStreamEvent],
     ) -> AsyncIterator[str]:
-        created = response.created_at
-        final_text = _extract_response_text(response)
-        tool_calls = _extract_response_tool_calls(response)
-        message = (
-            response.output_messages[0]
-            if response.output_messages
-            else CanonicalMessage(role="assistant")
-        )
-        reasoning_text = (
-            message.reasoning_content
-            if response.metadata.get("reasoning_summary") is not None
-            else None
-        )
-        message_id = f"msg_{uuid.uuid4().hex}"
-        in_progress_item = {
-            "id": message_id,
-            "type": "message",
-            "role": "assistant",
+        state = init_response_stream_formatter_state(response)
+        for event in iter_response_stream_events(state, events):
+            yield event
+        for event in finalize_response_stream(state):
+            yield event
+
+
+@dataclass
+class ResponseStreamFormatterState:
+    response: CanonicalResponse
+    created: int
+    public_metadata: dict[str, Any]
+    created_event_chunk: str = ""
+    final_text_parts: list[str] = field(default_factory=list)
+    sequence_number: int = 0
+    message_id: str = field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
+    message_output_index: int = 0
+    message_opened: bool = False
+    completed_item: dict[str, Any] | None = None
+
+
+def init_response_stream_formatter_state(
+    response: CanonicalResponse,
+) -> ResponseStreamFormatterState:
+    state = ResponseStreamFormatterState(
+        response=response,
+        created=response.created_at,
+        public_metadata=_public_response_metadata(response.metadata),
+    )
+    created_event = {
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {
+            "id": response.response_id,
+            "object": "response",
+            "created_at": response.created_at,
             "status": "in_progress",
-            "content": [],
-            "phase": "final_answer",
-        }
-        completed_item = {
-            "id": message_id,
-            "type": "message",
-            "role": "assistant",
-            "status": "completed",
-            "content": [
-                {
-                    "type": "output_text",
-                    "text": final_text,
-                    "annotations": [],
-                    "logprobs": [],
+            "model": response.model,
+            "output": [],
+            "parallel_tool_calls": False,
+            "tool_choice": "auto",
+            "tools": [],
+            "usage": {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "total_tokens": response.usage.total_tokens,
+            },
+            "metadata": state.public_metadata,
+        },
+    }
+    _log_stream_event(created_event)
+    state.completed_item = {
+        "id": state.message_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+            {
+                "type": "output_text",
+                "text": "",
+                "annotations": [],
+                "logprobs": [],
+            }
+        ],
+        "phase": "final_answer",
+    }
+    state.created_event_chunk = f"data: {json.dumps(created_event)}\n\n"
+    return state
+
+
+def iter_response_stream_events(
+    state: ResponseStreamFormatterState,
+    events: list[CanonicalStreamEvent],
+) -> list[str]:
+    emitted: list[str] = []
+    if state.created_event_chunk:
+        emitted.append(state.created_event_chunk)
+        state.created_event_chunk = ""
+    for stream_event in events:
+        if stream_event.event_type == "text_delta" and stream_event.delta is not None:
+            if not state.message_opened:
+                state.message_opened = True
+                state.sequence_number += 1
+                event = {
+                    "type": "response.output_item.added",
+                    "sequence_number": state.sequence_number,
+                    "output_index": state.message_output_index,
+                    "item": {
+                        "id": state.message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "in_progress",
+                        "content": [],
+                        "phase": "final_answer",
+                    },
                 }
-            ],
-            "phase": "final_answer",
-        }
-        reasoning_item = None
-        if reasoning_text is not None:
-            reasoning_item = _build_reasoning_item(
-                reasoning_text,
-                include_encrypted_content=_wants_reasoning_encrypted_content(response),
-            )
-        sequence_number = 0
-        public_metadata = _public_response_metadata(response.metadata)
+                _log_stream_event(event)
+                emitted.append(f"data: {json.dumps(event)}\n\n")
+                state.sequence_number += 1
+                event = {
+                    "type": "response.content_part.added",
+                    "sequence_number": state.sequence_number,
+                    "output_index": state.message_output_index,
+                    "item_id": state.message_id,
+                    "content_index": 0,
+                    "part": {
+                        "type": "output_text",
+                        "text": "",
+                        "annotations": [],
+                        "logprobs": [],
+                    },
+                }
+                _log_stream_event(event)
+                emitted.append(f"data: {json.dumps(event)}\n\n")
+            state.final_text_parts.append(stream_event.delta)
+            state.sequence_number += 1
+            event = {
+                "type": "response.output_text.delta",
+                "sequence_number": state.sequence_number,
+                "output_index": state.message_output_index,
+                "item_id": state.message_id,
+                "content_index": 0,
+                "delta": stream_event.delta,
+                "logprobs": [],
+            }
+            _log_stream_event(event)
+            emitted.append(f"data: {json.dumps(event)}\n\n")
+    return emitted
+
+
+def finalize_response_stream(state: ResponseStreamFormatterState) -> list[str]:
+    emitted: list[str] = []
+    final_text = "".join(state.final_text_parts)
+    if state.completed_item is None:
+        return emitted
+    state.completed_item["content"][0]["text"] = final_text
+    message = (
+        state.response.output_messages[0]
+        if state.response.output_messages
+        else CanonicalMessage(role="assistant")
+    )
+    reasoning_text = (
+        message.reasoning_content
+        if state.response.metadata.get("reasoning_summary") is not None
+        else None
+    )
+    reasoning_item = None
+    if reasoning_text is not None:
+        reasoning_item = _build_reasoning_item(
+            reasoning_text,
+            include_encrypted_content=_wants_reasoning_encrypted_content(state.response),
+        )
+    tool_calls = _extract_response_tool_calls(state.response)
+    if tool_calls:
+        state.message_output_index = len(tool_calls) + (1 if reasoning_item is not None else 0)
+    if not state.message_opened:
+        state.message_opened = True
+        state.sequence_number += 1
         event = {
-            "type": "response.created",
-            "sequence_number": 0,
-            "response": {
-                "id": response.response_id,
-                "object": "response",
-                "created_at": created,
+            "type": "response.output_item.added",
+            "sequence_number": state.sequence_number,
+            "output_index": state.message_output_index,
+            "item": {
+                "id": state.message_id,
+                "type": "message",
+                "role": "assistant",
                 "status": "in_progress",
-                "model": response.model,
-                "output": [],
-                "parallel_tool_calls": len(tool_calls) > 1,
-                "tool_choice": "auto",
-                "tools": [],
-                "usage": {
-                    "input_tokens": response.usage.input_tokens,
-                    "output_tokens": response.usage.output_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                },
-                "metadata": public_metadata,
+                "content": [],
+                "phase": "final_answer",
             },
         }
         _log_stream_event(event)
-        yield f"data: {json.dumps(event)}\n\n"
-        tool_call_events_by_id: dict[str, list[CanonicalStreamEvent]] = {}
-        for stream_event in events:
-            if (
-                stream_event.event_type != "function_call_arguments_delta"
-                or stream_event.item_id is None
-            ):
-                continue
-            tool_call_events_by_id.setdefault(stream_event.item_id, []).append(stream_event)
-
-        for output_index, tool_call in enumerate(tool_calls):
-            sequence_number += 1
-            event = {
-                "type": "response.output_item.added",
-                "sequence_number": sequence_number,
-                "output_index": output_index,
-                "item": {
-                    "id": tool_call.id,
-                    "type": "function_call",
-                    "call_id": tool_call.id,
-                    "name": tool_call.name,
-                    "arguments": "",
-                    "status": "in_progress",
-                },
-            }
-            _log_stream_event(event)
-            yield f"data: {json.dumps(event)}\n\n"
-
-            for stream_event in tool_call_events_by_id.get(tool_call.id, []):
-                sequence_number += 1
-                event = {
-                    "type": "response.function_call_arguments.delta",
-                    "sequence_number": sequence_number,
-                    "output_index": output_index,
-                    "item_id": tool_call.id,
-                    "delta": stream_event.delta or "",
-                }
-                _log_stream_event(event)
-                yield f"data: {json.dumps(event)}\n\n"
-
-            sequence_number += 1
-            event = {
-                "type": "response.function_call_arguments.done",
-                "sequence_number": sequence_number,
-                "output_index": output_index,
-                "item_id": tool_call.id,
-                "arguments": tool_call.arguments,
-                "name": tool_call.name,
-            }
-            _log_stream_event(event)
-            yield f"data: {json.dumps(event)}\n\n"
-            sequence_number += 1
-            event = {
-                "type": "response.output_item.done",
-                "sequence_number": sequence_number,
-                "output_index": output_index,
-                "item": {
-                    "id": tool_call.id,
-                    "type": "function_call",
-                    "call_id": tool_call.id,
-                    "name": tool_call.name,
-                    "arguments": tool_call.arguments,
-                    "status": "completed",
-                },
-            }
-            _log_stream_event(event)
-            yield f"data: {json.dumps(event)}\n\n"
-
-        if reasoning_item is not None:
-            sequence_number += 1
-            event = {
-                "type": "response.output_item.added",
-                "sequence_number": sequence_number,
-                "output_index": len(tool_calls),
-                "item": reasoning_item,
-            }
-            _log_stream_event(event)
-            yield f"data: {json.dumps(event)}\n\n"
-            sequence_number += 1
-            event = {
-                "type": "response.output_item.done",
-                "sequence_number": sequence_number,
-                "output_index": len(tool_calls),
-                "item": reasoning_item,
-            }
-            _log_stream_event(event)
-            yield f"data: {json.dumps(event)}\n\n"
-
-        message_output_index = len(tool_calls) + (1 if reasoning_item is not None else 0)
-        sequence_number += 1
+        emitted.append(f"data: {json.dumps(event)}\n\n")
+    for output_index, tool_call in enumerate(tool_calls):
+        state.sequence_number += 1
         event = {
             "type": "response.output_item.added",
-            "sequence_number": sequence_number,
-            "output_index": message_output_index,
-            "item": in_progress_item,
+            "sequence_number": state.sequence_number,
+            "output_index": output_index,
+            "item": {
+                "id": tool_call.id,
+                "type": "function_call",
+                "call_id": tool_call.id,
+                "name": tool_call.name,
+                "arguments": "",
+                "status": "in_progress",
+            },
         }
         _log_stream_event(event)
-        yield f"data: {json.dumps(event)}\n\n"
-        sequence_number += 1
+        emitted.append(f"data: {json.dumps(event)}\n\n")
+        for stream_event in state.response.metadata.get("_stream_events", []):
+            if stream_event.event_type != "function_call_arguments_delta":
+                continue
+            if stream_event.item_id != tool_call.id:
+                continue
+            state.sequence_number += 1
+            event = {
+                "type": "response.function_call_arguments.delta",
+                "sequence_number": state.sequence_number,
+                "output_index": output_index,
+                "item_id": tool_call.id,
+                "delta": stream_event.delta or "",
+            }
+            _log_stream_event(event)
+            emitted.append(f"data: {json.dumps(event)}\n\n")
+        state.sequence_number += 1
+        event = {
+            "type": "response.function_call_arguments.done",
+            "sequence_number": state.sequence_number,
+            "output_index": output_index,
+            "item_id": tool_call.id,
+            "arguments": tool_call.arguments,
+            "name": tool_call.name,
+        }
+        _log_stream_event(event)
+        emitted.append(f"data: {json.dumps(event)}\n\n")
+        state.sequence_number += 1
+        event = {
+            "type": "response.output_item.done",
+            "sequence_number": state.sequence_number,
+            "output_index": output_index,
+            "item": {
+                "id": tool_call.id,
+                "type": "function_call",
+                "call_id": tool_call.id,
+                "name": tool_call.name,
+                "arguments": tool_call.arguments,
+                "status": "completed",
+            },
+        }
+        _log_stream_event(event)
+        emitted.append(f"data: {json.dumps(event)}\n\n")
+    if reasoning_item is not None:
+        state.sequence_number += 1
+        event = {
+            "type": "response.output_item.added",
+            "sequence_number": state.sequence_number,
+            "output_index": len(tool_calls),
+            "item": reasoning_item,
+        }
+        _log_stream_event(event)
+        emitted.append(f"data: {json.dumps(event)}\n\n")
+        state.sequence_number += 1
+        event = {
+            "type": "response.output_item.done",
+            "sequence_number": state.sequence_number,
+            "output_index": len(tool_calls),
+            "item": reasoning_item,
+        }
+        _log_stream_event(event)
+        emitted.append(f"data: {json.dumps(event)}\n\n")
+        state.sequence_number += 1
         event = {
             "type": "response.content_part.added",
-            "sequence_number": sequence_number,
-            "output_index": message_output_index,
-            "item_id": message_id,
+            "sequence_number": state.sequence_number,
+            "output_index": state.message_output_index,
+            "item_id": state.message_id,
             "content_index": 0,
             "part": {
                 "type": "output_text",
@@ -564,98 +651,79 @@ class OpenAIResponsesAdapter:
             },
         }
         _log_stream_event(event)
-        yield f"data: {json.dumps(event)}\n\n"
-        for event in events:
-            if event.event_type != "text_delta" or event.delta is None:
-                continue
-            sequence_number += 1
-            chunk_event = {
-                "type": "response.output_text.delta",
-                "sequence_number": sequence_number,
-                "output_index": message_output_index,
-                "item_id": message_id,
-                "content_index": 0,
-                "delta": event.delta,
-                "logprobs": [],
-            }
-            _log_stream_event(chunk_event)
-            yield f"data: {json.dumps(chunk_event)}\n\n"
-        sequence_number += 1
-        event = {
-            "type": "response.output_text.done",
-            "sequence_number": sequence_number,
-            "output_index": message_output_index,
-            "item_id": message_id,
-            "content_index": 0,
-            "text": final_text,
-            "logprobs": [],
-        }
-        _log_stream_event(event)
-        yield f"data: {json.dumps(event)}\n\n"
-        sequence_number += 1
-        event = {
-            "type": "response.content_part.done",
-            "sequence_number": sequence_number,
-            "output_index": message_output_index,
-            "item_id": message_id,
-            "content_index": 0,
-            "part": {
-                "type": "output_text",
-                "text": final_text,
-                "annotations": [],
-                "logprobs": [],
-            },
-        }
-        _log_stream_event(event)
-        yield f"data: {json.dumps(event)}\n\n"
-        payload = {
-            "id": response.response_id,
-            "object": "response",
-            "created_at": response.created_at,
-            "status": "completed",
-            "model": response.model,
-            "output": [
-                *[
-                    {
-                        "id": tool_call.id,
-                        "type": "function_call",
-                        "call_id": tool_call.id,
-                        "name": tool_call.name,
-                        "arguments": tool_call.arguments,
-                        "status": "completed",
-                    }
-                    for tool_call in tool_calls
-                ],
-                *([reasoning_item] if reasoning_item is not None else []),
-                completed_item,
+        emitted.append(f"data: {json.dumps(event)}\n\n")
+    state.sequence_number += 1
+    event = {
+        "type": "response.output_text.done",
+        "sequence_number": state.sequence_number,
+        "output_index": state.message_output_index,
+        "item_id": state.message_id,
+        "content_index": 0,
+        "text": final_text,
+        "logprobs": [],
+    }
+    _log_stream_event(event)
+    emitted.append(f"data: {json.dumps(event)}\n\n")
+    state.sequence_number += 1
+    event = {
+        "type": "response.content_part.done",
+        "sequence_number": state.sequence_number,
+        "output_index": state.message_output_index,
+        "item_id": state.message_id,
+        "content_index": 0,
+        "part": state.completed_item["content"][0],
+    }
+    _log_stream_event(event)
+    emitted.append(f"data: {json.dumps(event)}\n\n")
+    state.sequence_number += 1
+    event = {
+        "type": "response.output_item.done",
+        "sequence_number": state.sequence_number,
+        "output_index": state.message_output_index,
+        "item": state.completed_item,
+    }
+    _log_stream_event(event)
+    emitted.append(f"data: {json.dumps(event)}\n\n")
+    payload = {
+        "id": state.response.response_id,
+        "object": "response",
+        "created_at": state.response.created_at,
+        "status": "completed",
+        "model": state.response.model,
+        "output": [
+            *[
+                {
+                    "id": tool_call.id,
+                    "type": "function_call",
+                    "call_id": tool_call.id,
+                    "name": tool_call.name,
+                    "arguments": tool_call.arguments,
+                    "status": "completed",
+                }
+                for tool_call in tool_calls
             ],
-            "parallel_tool_calls": len(tool_calls) > 1,
-            "tool_choice": "auto",
-            "tools": [],
-            "usage": {
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-                "total_tokens": response.usage.total_tokens,
-            },
-            "metadata": public_metadata,
-        }
-        sequence_number += 1
-        event = {
-            "type": "response.output_item.done",
-            "sequence_number": sequence_number,
-            "output_index": message_output_index,
-            "item": completed_item,
-        }
-        _log_stream_event(event)
-        yield f"data: {json.dumps(event)}\n\n"
-        sequence_number += 1
-        event = {
-            "type": "response.completed",
-            "sequence_number": sequence_number,
-            "response": payload,
-        }
-        _log_stream_event(event)
-        yield f"data: {json.dumps(event)}\n\n"
+            *([reasoning_item] if reasoning_item is not None else []),
+            state.completed_item,
+        ],
+        "parallel_tool_calls": False,
+        "tool_choice": "auto",
+        "tools": [],
+        "usage": {
+            "input_tokens": state.response.usage.input_tokens,
+            "output_tokens": state.response.usage.output_tokens,
+            "total_tokens": state.response.usage.total_tokens,
+        },
+        "metadata": state.public_metadata,
+    }
+    state.sequence_number += 1
+    event = {
+        "type": "response.completed",
+        "sequence_number": state.sequence_number,
+        "response": payload,
+    }
+    _log_stream_event(event)
+    emitted.append(f"data: {json.dumps(event)}\n\n")
+    return emitted
 
 
 def _optional_float(value: Any) -> float | None:

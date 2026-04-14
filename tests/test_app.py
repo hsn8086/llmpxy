@@ -9,12 +9,13 @@ from typing import Any, cast
 import pytest
 from fastapi.testclient import TestClient
 
-from llmpxy.app import _live_stream_passthrough, create_app
+from llmpxy.app import _prepare_live_stream_bridge, _prepare_live_stream_passthrough, create_app
 from llmpxy.config import AppConfig
 from llmpxy.dispatcher import ProviderDispatcher
 from llmpxy.models import CanonicalResponse, CanonicalUsage
 from llmpxy.protocols.anthropic_messages import AnthropicAdapter
 from llmpxy.protocols.oai_chat import OpenAIChatAdapter
+from llmpxy.protocols.oai_responses import OpenAIResponsesAdapter
 from llmpxy.storage_sqlite import SQLiteConversationStore
 
 
@@ -2617,7 +2618,7 @@ async def test_oaichat_stream_passthrough_emits_first_chunk_before_upstream_fini
         },
         strip_unsupported_fields=True,
     )
-    generator = _live_stream_passthrough(
+    generator = await _prepare_live_stream_passthrough(
         inbound_protocol="oaichat",
         request_id="req-live",
         canonical_request=canonical_request,
@@ -2640,6 +2641,104 @@ async def test_oaichat_stream_passthrough_emits_first_chunk_before_upstream_fini
 
     assert second_chunk_released.is_set()
     assert any('"content": "lo"' in chunk for chunk in remaining_chunks)
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+@pytest.mark.asyncio
+async def test_oairesp_live_bridge_from_oaichat_emits_text_deltas_early(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import threading
+    import httpx
+
+    second_chunk_released = threading.Event()
+
+    async def stream_success() -> AsyncIterator[bytes]:
+        first = json.dumps(
+            {
+                "id": "chat1",
+                "model": "a-model",
+                "choices": [{"delta": {"content": "Hel"}}],
+            }
+        )
+        yield f"data: {first}\n\n".encode()
+        await asyncio.sleep(0.15)
+        second = json.dumps(
+            {
+                "id": "chat1",
+                "model": "a-model",
+                "choices": [{"delta": {"content": "lo"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            }
+        )
+        yield f"data: {second}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+        second_chunk_released.set()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=stream_success(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-4.1": "a-model"},
+                }
+            ],
+        }
+    )
+    adapter = OpenAIResponsesAdapter()
+    canonical_request = adapter.parse_request(
+        {"model": "gpt-4.1", "input": "hi", "stream": True},
+        strip_unsupported_fields=True,
+    )
+    generator = await _prepare_live_stream_bridge(
+        inbound_protocol="oairesp",
+        request_id="req-live-oairesp",
+        canonical_request=canonical_request,
+        provider=config.providers[0],
+        adapter=adapter,
+        runtime=None,
+        api_key=None,
+        store=SQLiteConversationStore(tmp_path / "live-stream-oairesp.db"),
+        config=config,
+        started_perf=0.0,
+    )
+
+    first_chunk = await anext(generator)
+    assert '"type": "response.created"' in first_chunk
+
+    second_chunk = await anext(generator)
+    assert '"type": "response.output_item.added"' in second_chunk
+    assert not second_chunk_released.is_set()
+
+    deltas: list[str] = []
+    async for chunk in generator:
+        if '"type": "response.output_text.delta"' in chunk:
+            deltas.append(chunk)
+
+    assert second_chunk_released.is_set()
+    assert any('"delta": "Hel"' in chunk for chunk in deltas)
+    assert any('"delta": "lo"' in chunk for chunk in deltas)
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
@@ -2768,6 +2867,59 @@ def test_anthropic_stream_passthrough_sets_anti_buffering_headers(
 
     assert "event: message_start" in body
     assert "event: message_stop" in body
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+def test_anthropic_live_stream_returns_http_error_before_response_starts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("B_KEY", "b")
+
+    import httpx
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "b"},
+            "providers": [
+                {
+                    "name": "b",
+                    "protocol": "anthropic",
+                    "base_url": "https://api.anthropic.com",
+                    "api_key_env": "B_KEY",
+                    "models": {"gpt-5.4": "gpt-5.4"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "anthropic-live-error.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.4",
+            "stream": True,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Provider b returned HTTP 404"
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
