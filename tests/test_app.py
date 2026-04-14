@@ -2369,6 +2369,119 @@ def test_oairesp_accepts_function_call_output_items(
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
+def test_oairesp_previous_response_id_preserves_empty_assistant_tool_call_content_for_oaichat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    captured_bodies: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_bodies.append(json.loads(request.content.decode("utf-8")))
+        body = captured_bodies[-1]
+        if len(captured_bodies) == 1:
+            assert body["messages"] == [{"role": "user", "content": "hi"}]
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_1",
+                    "model": "a-model",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "glob",
+                                            "arguments": '{"pattern":"**/*.md"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+        assert body["messages"][0]["role"] == "assistant"
+        assert body["messages"][0]["tool_calls"][0]["id"] == "call_1"
+        assert body["messages"][0]["content"] == ""
+        assert body["messages"][1] == {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "README.md",
+        }
+        assert body["messages"][2] == {"role": "user", "content": "continue"}
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_2",
+                "model": "a-model",
+                "choices": [{"message": {"role": "assistant", "content": "done"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "storage": {
+                "backend": "sqlite",
+                "sqlite_path": str(tmp_path / "history-tool-call.db"),
+                "ttl_seconds": 60,
+            },
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "a-model"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "history-tool-call.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    first = client.post("/v1/responses", json={"model": "gpt-5.4", "input": "hi"})
+    assert first.status_code == 200
+    first_id = first.json()["id"]
+
+    second = client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.4",
+            "previous_response_id": first_id,
+            "input": [
+                {"type": "function_call_output", "call_id": "call_1", "output": "README.md"},
+                {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+            ],
+        },
+    )
+
+    assert second.status_code == 200
+    assert len(captured_bodies) == 2
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
 def test_oairesp_accepts_single_content_object_in_input(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

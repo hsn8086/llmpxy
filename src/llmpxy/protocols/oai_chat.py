@@ -482,7 +482,9 @@ def _normalize_tool_calls(value: Any) -> list[CanonicalToolCall]:
 def _message_to_oaichat(message: CanonicalMessage) -> dict[str, Any]:
     role = "system" if message.role == "developer" else message.role
     payload: dict[str, Any] = {"role": role}
-    if (
+    if not message.content and message.role == "assistant" and message.tool_calls:
+        payload["content"] = ""
+    elif (
         len(message.content) == 1
         and message.content[0].type == "text"
         and message.content[0].text is not None
