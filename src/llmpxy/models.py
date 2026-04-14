@@ -81,3 +81,52 @@ class StoredConversation(BaseModel):
     response_payload: dict[str, Any]
     metadata: dict[str, Any] = Field(default_factory=dict)
     expires_at: int | None = None
+
+
+class ApiKeyUsageRecord(BaseModel):
+    api_key_uuid: str
+    api_key_name: str
+    request_id: str
+    provider_name: str
+    requested_model: str
+    upstream_model: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cost_usd: float = 0.0
+    created_at: int
+
+
+class RequestEventRecord(BaseModel):
+    request_id: str
+    started_at: int
+    finished_at: int | None = None
+    latency_ms: int | None = None
+    protocol_in: ProtocolName
+    stream: bool = False
+    api_key_uuid: str | None = None
+    api_key_name: str | None = None
+    provider_name: str | None = None
+    requested_model: str | None = None
+    upstream_model: str | None = None
+    status: Literal[
+        "success",
+        "provider_error",
+        "all_failed",
+        "auth_error",
+        "budget_rejected",
+        "bad_request",
+    ]
+    http_status: int
+    error_code: str | None = None
+    error_message: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cost_usd: float = 0.0
+
+
+class AdminEvent(BaseModel):
+    event_type: Literal["request", "reload", "config"]
+    created_at: int
+    payload: dict[str, Any] = Field(default_factory=dict)

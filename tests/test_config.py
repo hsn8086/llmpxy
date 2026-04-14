@@ -147,3 +147,140 @@ api_key_env = "DOTENV_TEST_KEY"
     config = load_config(config_file)
 
     assert config.providers[0].api_key() == "from-dotenv"
+
+
+def test_api_key_limits_reference_known_provider_and_group() -> None:
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(
+            {
+                "route": {"type": "provider", "name": "openai-a"},
+                "api_keys": [
+                    {
+                        "uuid": "11111111-1111-1111-1111-111111111111",
+                        "name": "client-a",
+                        "key": "client-a-key",
+                        "provider_limits_usd": {"missing": 1.0},
+                    }
+                ],
+                "providers": [
+                    {
+                        "name": "openai-a",
+                        "protocol": "oaichat",
+                        "base_url": "https://a.example/v1",
+                        "api_key_env": "A_KEY",
+                    }
+                ],
+            }
+        )
+
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(
+            {
+                "route": {"type": "provider", "name": "openai-a"},
+                "api_keys": [
+                    {
+                        "uuid": "11111111-1111-1111-1111-111111111111",
+                        "name": "client-a",
+                        "key": "client-a-key",
+                        "group_limits_usd": {"missing-group": 1.0},
+                    }
+                ],
+                "providers": [
+                    {
+                        "name": "openai-a",
+                        "protocol": "oaichat",
+                        "base_url": "https://a.example/v1",
+                        "api_key_env": "A_KEY",
+                    }
+                ],
+                "provider_groups": [
+                    {"name": "default", "strategy": "fallback", "members": ["openai-a"]}
+                ],
+            }
+        )
+
+
+def test_provider_pricing_supports_default_and_model_override() -> None:
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "openai-a"},
+            "providers": [
+                {
+                    "name": "openai-a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "pricing": {
+                        "default": {
+                            "input_per_million_tokens_usd": 1.0,
+                            "output_per_million_tokens_usd": 2.0,
+                        },
+                        "models": {
+                            "gpt-4.1": {
+                                "input_per_million_tokens_usd": 3.0,
+                                "output_per_million_tokens_usd": 4.0,
+                            }
+                        },
+                    },
+                }
+            ],
+        }
+    )
+
+    provider = config.providers[0]
+    assert provider.resolve_pricing("gpt-4.1", "mapped-model") is not None
+    assert provider.resolve_pricing("missing", "mapped-model") == provider.pricing.default
+
+
+def test_api_key_uuid_must_be_unique() -> None:
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(
+            {
+                "route": {"type": "provider", "name": "openai-a"},
+                "api_keys": [
+                    {
+                        "uuid": "11111111-1111-1111-1111-111111111111",
+                        "name": "client-a",
+                        "key": "client-a-key",
+                    },
+                    {
+                        "uuid": "11111111-1111-1111-1111-111111111111",
+                        "name": "client-b",
+                        "key": "client-b-key",
+                    },
+                ],
+                "providers": [
+                    {
+                        "name": "openai-a",
+                        "protocol": "oaichat",
+                        "base_url": "https://a.example/v1",
+                        "api_key_env": "A_KEY",
+                    }
+                ],
+            }
+        )
+
+
+def test_provider_group_model_whitelist_requires_models() -> None:
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(
+            {
+                "route": {"type": "group", "name": "default"},
+                "providers": [
+                    {
+                        "name": "openai-a",
+                        "protocol": "oaichat",
+                        "base_url": "https://a.example/v1",
+                        "api_key_env": "A_KEY",
+                    }
+                ],
+                "provider_groups": [
+                    {
+                        "name": "default",
+                        "strategy": "fallback",
+                        "model_whitelist_only": True,
+                        "members": ["openai-a"],
+                    }
+                ],
+            }
+        )

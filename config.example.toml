@@ -31,11 +31,23 @@ debug_file = "debug.log"
 rotation = "100 MB"
 retention = "10 days"
 
+[admin]
+enabled = true
+token = "replace-with-a-strong-admin-token"
+
 [storage]
 backend = "sqlite"
 sqlite_path = "./data/llmpxy.db"
 file_dir = "./data/conversations"
 ttl_seconds = 604800
+
+[[api_keys]]
+uuid = "11111111-1111-1111-1111-111111111111"
+name = "default-client"
+key = "replace-with-a-strong-client-key"
+limit_usd = 50.0
+provider_limits_usd = { openai-chat-a = 30.0, anthropic-a = 20.0 }
+group_limits_usd = { default = 40.0 }
 
 [[providers]]
 name = "openai-chat-a"
@@ -45,9 +57,21 @@ api_key_env = "PROVIDER_A_API_KEY"
 timeout_seconds = 120.0
 model_whitelist_only = true
 
+[providers.pricing.default]
+input_per_million_tokens_usd = 0.50
+output_per_million_tokens_usd = 2.00
+
 [providers.models]
 "gpt-4.1" = "provider-a-chat-model"
 "gpt-4.1-mini" = "provider-a-chat-model-mini"
+
+[providers.pricing.models."gpt-4.1"]
+input_per_million_tokens_usd = 1.00
+output_per_million_tokens_usd = 4.00
+
+[providers.pricing.models."gpt-4.1-mini"]
+input_per_million_tokens_usd = 0.30
+output_per_million_tokens_usd = 1.20
 
 [[providers]]
 name = "anthropic-a"
@@ -57,10 +81,20 @@ api_key_env = "ANTHROPIC_API_KEY"
 timeout_seconds = 120.0
 anthropic_version = "2023-06-01"
 
+[providers.pricing.default]
+input_per_million_tokens_usd = 3.00
+output_per_million_tokens_usd = 15.00
+
 [providers.models]
 "claude-sonnet" = "claude-3-7-sonnet-latest"
+
+[providers.pricing.models."claude-sonnet"]
+input_per_million_tokens_usd = 3.00
+output_per_million_tokens_usd = 15.00
 
 [[provider_groups]]
 name = "default"
 strategy = "fallback"
+model_whitelist_only = true
+models = ["gpt-4.1", "gpt-4.1-mini", "claude-sonnet"]
 members = ["openai-chat-a", "anthropic-a"]

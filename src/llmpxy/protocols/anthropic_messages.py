@@ -205,6 +205,10 @@ class AnthropicAdapter:
                 "role": "assistant",
                 "model": response.model,
                 "content": [],
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                },
             },
         }
         yield f"event: message_start\ndata: {json.dumps(start_event)}\n\n"

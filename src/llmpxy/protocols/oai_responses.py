@@ -34,6 +34,10 @@ class OpenAIResponsesAdapter:
         model = payload.get("model")
         if not isinstance(model, str) or not model:
             raise HTTPException(status_code=400, detail="model is required")
+        metadata = _normalize_metadata(payload.get("metadata"))
+        include = _normalize_include(payload.get("include"))
+        if include:
+            metadata["_request_include"] = include
 
         return CanonicalRequest(
             protocol_in="oairesp",
@@ -52,7 +56,7 @@ class OpenAIResponsesAdapter:
             response_format=payload.get("response_format")
             if isinstance(payload.get("response_format"), dict)
             else None,
-            metadata=_normalize_metadata(payload.get("metadata")),
+            metadata=metadata,
             conversation_reference=payload.get("previous_response_id")
             if isinstance(payload.get("previous_response_id"), str)
             else None,
@@ -86,8 +90,9 @@ class OpenAIResponsesAdapter:
             payload["tool_choice"] = request.tool_choice
         if request.response_format is not None:
             payload["text"] = {"format": request.response_format}
-        if request.metadata:
-            payload["metadata"] = request.metadata
+        metadata = _build_upstream_metadata(request.metadata)
+        if metadata:
+            payload["metadata"] = metadata
         logger.bind(request_id="-", provider="-", round=0, attempt=0).debug(
             "oairesp build_request mapped_model={} instructions_len={} reasoning={}",
             mapped_model,
@@ -340,19 +345,14 @@ class OpenAIResponsesAdapter:
             and response.metadata.get("reasoning_summary") is not None
         ):
             output_items.append(
-                {
-                    "id": f"rs_{uuid.uuid4().hex}",
-                    "type": "reasoning",
-                    "summary": [
-                        {
-                            "type": "summary_text",
-                            "text": message.reasoning_content,
-                        }
-                    ],
-                }
+                _build_reasoning_item(
+                    message.reasoning_content,
+                    include_encrypted_content=_wants_reasoning_encrypted_content(response),
+                )
             )
         output_items.append(output_item)
 
+        public_metadata = _public_response_metadata(response.metadata)
         return {
             "id": response.response_id,
             "object": "response",
@@ -368,7 +368,7 @@ class OpenAIResponsesAdapter:
                 "output_tokens": response.usage.output_tokens,
                 "total_tokens": response.usage.total_tokens,
             },
-            "metadata": response.metadata,
+            "metadata": public_metadata,
         }
 
     async def format_stream(
@@ -415,17 +415,12 @@ class OpenAIResponsesAdapter:
         }
         reasoning_item = None
         if reasoning_text is not None:
-            reasoning_item = {
-                "id": f"rs_{uuid.uuid4().hex}",
-                "type": "reasoning",
-                "summary": [
-                    {
-                        "type": "summary_text",
-                        "text": reasoning_text,
-                    }
-                ],
-            }
+            reasoning_item = _build_reasoning_item(
+                reasoning_text,
+                include_encrypted_content=_wants_reasoning_encrypted_content(response),
+            )
         sequence_number = 0
+        public_metadata = _public_response_metadata(response.metadata)
         event = {
             "type": "response.created",
             "sequence_number": 0,
@@ -444,7 +439,7 @@ class OpenAIResponsesAdapter:
                     "output_tokens": response.usage.output_tokens,
                     "total_tokens": response.usage.total_tokens,
                 },
-                "metadata": response.metadata,
+                "metadata": public_metadata,
             },
         }
         _log_stream_event(event)
@@ -634,7 +629,7 @@ class OpenAIResponsesAdapter:
                 "output_tokens": response.usage.output_tokens,
                 "total_tokens": response.usage.total_tokens,
             },
-            "metadata": response.metadata,
+            "metadata": public_metadata,
         }
         sequence_number += 1
         event = {
@@ -677,6 +672,14 @@ def _normalize_metadata(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _build_upstream_metadata(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if not key.startswith("_")}
+
+
+def _public_response_metadata(value: dict[str, Any]) -> dict[str, Any]:
+    return _build_upstream_metadata(value)
+
+
 def _normalize_reasoning(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -688,6 +691,35 @@ def _normalize_reasoning(value: Any) -> dict[str, Any] | None:
     if "summary" not in reasoning and "effort" in reasoning:
         reasoning["summary"] = "auto"
     return reasoning or None
+
+
+def _normalize_include(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _wants_reasoning_encrypted_content(response: CanonicalResponse) -> bool:
+    include = response.metadata.get("_request_include")
+    return isinstance(include, list) and "reasoning.encrypted_content" in include
+
+
+def _build_reasoning_item(
+    reasoning_text: str, *, include_encrypted_content: bool
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "id": f"rs_{uuid.uuid4().hex}",
+        "type": "reasoning",
+        "summary": [
+            {
+                "type": "summary_text",
+                "text": reasoning_text,
+            }
+        ],
+    }
+    if include_encrypted_content:
+        item["encrypted_content"] = reasoning_text
+    return item
 
 
 def _build_reasoning_payload(value: dict[str, Any] | None) -> dict[str, Any] | None:

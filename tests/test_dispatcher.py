@@ -8,6 +8,10 @@ from llmpxy.dispatcher import AllProvidersFailedError, ProviderDispatcher
 from llmpxy.models import CanonicalContentPart, CanonicalMessage, CanonicalRequest
 
 
+def _reverse_members(members: list[str]) -> None:
+    members.reverse()
+
+
 def _request(protocol_in: ProtocolName = "oairesp", stream: bool = False) -> CanonicalRequest:
     return CanonicalRequest(
         protocol_in=protocol_in,
@@ -48,6 +52,37 @@ def _config() -> AppConfig:
             "provider_groups": [{"name": "default", "strategy": "fallback", "members": ["a", "b"]}],
         }
     )
+
+
+def test_group_route_supports_group_model_whitelist() -> None:
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "group", "name": "default"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-4.1": "a-model"},
+                }
+            ],
+            "provider_groups": [
+                {
+                    "name": "default",
+                    "strategy": "fallback",
+                    "model_whitelist_only": True,
+                    "models": ["gpt-4.1"],
+                    "members": ["a"],
+                }
+            ],
+        }
+    )
+
+    dispatcher = ProviderDispatcher(config)
+
+    assert dispatcher.route_supports_model("gpt-4.1") is True
+    assert dispatcher.route_supports_model("gpt-4.1-mini") is False
 
 
 @pytest.mark.asyncio
@@ -175,20 +210,124 @@ async def test_dispatcher_load_balances_group_members(monkeypatch: pytest.Monkey
             super().__init__(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    monkeypatch.setattr("llmpxy.dispatcher.random.shuffle", _reverse_members)
     dispatcher = ProviderDispatcher(config)
 
-    response1, provider1 = await dispatcher.dispatch(
+    response, provider = await dispatcher.dispatch(
         _request(protocol_in="oaichat"), request_id="req-3"
     )
-    response2, provider2 = await dispatcher.dispatch(
-        _request(protocol_in="oaichat"), request_id="req-4"
+
+    assert provider.name == "b"
+    assert response.model == "b-model"
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_load_balance_order_stays_fixed_across_retry_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+    monkeypatch.setenv("B_KEY", "b")
+
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "group", "name": "balanced"},
+            "retry": {
+                "provider_error_threshold": 1,
+                "base_backoff_seconds": 0.001,
+                "max_backoff_seconds": 0.002,
+                "max_rounds": 2,
+            },
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-4.1": "a-model"},
+                },
+                {
+                    "name": "b",
+                    "protocol": "oaichat",
+                    "base_url": "https://b.example/v1",
+                    "api_key_env": "B_KEY",
+                    "models": {"gpt-4.1": "b-model"},
+                },
+            ],
+            "provider_groups": [
+                {"name": "balanced", "strategy": "load_balance", "members": ["a", "b"]}
+            ],
+        }
     )
 
-    assert provider1.name == "a"
-    assert provider2.name == "b"
-    assert response1.model == "a-model"
-    assert response2.model == "b-model"
+    attempts: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.url.host or "")
+        return httpx.Response(500, text="retryable fail")
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    monkeypatch.setattr("llmpxy.dispatcher.random.shuffle", _reverse_members)
+    dispatcher = ProviderDispatcher(config)
+
+    with pytest.raises(AllProvidersFailedError):
+        await dispatcher.dispatch(_request(protocol_in="oaichat"), request_id="req-4")
+
+    assert attempts == ["b.example", "a.example", "b.example", "a.example"]
     monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+def test_dispatcher_load_balances_nested_groups(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "group", "name": "global"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                },
+                {
+                    "name": "b",
+                    "protocol": "oaichat",
+                    "base_url": "https://b.example/v1",
+                    "api_key_env": "B_KEY",
+                },
+                {
+                    "name": "c",
+                    "protocol": "oaichat",
+                    "base_url": "https://c.example/v1",
+                    "api_key_env": "C_KEY",
+                },
+            ],
+            "provider_groups": [
+                {"name": "inner", "strategy": "load_balance", "members": ["a", "b"]},
+                {"name": "global", "strategy": "load_balance", "members": ["inner", "c"]},
+            ],
+        }
+    )
+
+    monkeypatch.setattr("llmpxy.dispatcher.random.shuffle", _reverse_members)
+    dispatcher = ProviderDispatcher(config)
+
+    assert [provider.name for provider in dispatcher.resolve_route_provider_order()] == [
+        "c",
+        "b",
+        "a",
+    ]
+    assert [provider.name for provider in dispatcher.resolve_route_provider_order_for_limits()] == [
+        "a",
+        "b",
+        "c",
+    ]
 
 
 @pytest.mark.asyncio

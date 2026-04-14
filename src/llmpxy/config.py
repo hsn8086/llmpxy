@@ -25,6 +25,46 @@ class NetworkConfig(BaseModel):
     pool_timeout_seconds: float = 30.0
 
 
+class ApiKeyConfig(BaseModel):
+    uuid: str
+    name: str
+    key: str
+    enabled: bool = True
+    limit_usd: float | None = None
+    provider_limits_usd: dict[str, float] = Field(default_factory=dict)
+    group_limits_usd: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_limit(self) -> "ApiKeyConfig":
+        if self.limit_usd is not None and self.limit_usd < 0:
+            raise ValueError("api_keys.limit_usd must be >= 0")
+        for provider_name, limit in self.provider_limits_usd.items():
+            if limit < 0:
+                raise ValueError(f"api_keys.provider_limits_usd[{provider_name!r}] must be >= 0")
+        for group_name, limit in self.group_limits_usd.items():
+            if limit < 0:
+                raise ValueError(f"api_keys.group_limits_usd[{group_name!r}] must be >= 0")
+        return self
+
+
+class PricingConfig(BaseModel):
+    input_per_million_tokens_usd: float
+    output_per_million_tokens_usd: float
+
+    @model_validator(mode="after")
+    def validate_pricing(self) -> "PricingConfig":
+        if self.input_per_million_tokens_usd < 0:
+            raise ValueError("pricing.input_per_million_tokens_usd must be >= 0")
+        if self.output_per_million_tokens_usd < 0:
+            raise ValueError("pricing.output_per_million_tokens_usd must be >= 0")
+        return self
+
+
+class ProviderPricingConfig(BaseModel):
+    default: PricingConfig | None = None
+    models: dict[str, PricingConfig] = Field(default_factory=dict)
+
+
 class ProviderConfig(BaseModel):
     name: str
     protocol: ProtocolName
@@ -35,6 +75,7 @@ class ProviderConfig(BaseModel):
     anthropic_version: str = "2023-06-01"
     model_whitelist_only: bool = False
     models: dict[str, str] = Field(default_factory=dict)
+    pricing: ProviderPricingConfig = Field(default_factory=ProviderPricingConfig)
 
     def api_key(self) -> str:
         value = os.getenv(self.api_key_env)
@@ -50,11 +91,27 @@ class ProviderConfig(BaseModel):
             return True
         return requested_model in self.models
 
+    def resolve_pricing(self, *model_names: str | None) -> PricingConfig | None:
+        for model_name in model_names:
+            if model_name is None:
+                continue
+            pricing = self.pricing.models.get(model_name)
+            if pricing is not None:
+                return pricing
+        return self.pricing.default
+
 
 class ProviderGroupConfig(BaseModel):
     name: str
     strategy: Literal["fallback", "load_balance"] = "fallback"
     members: list[str] = Field(default_factory=list)
+    model_whitelist_only: bool = False
+    models: list[str] = Field(default_factory=list)
+
+    def supports_model(self, requested_model: str) -> bool:
+        if not self.model_whitelist_only:
+            return True
+        return requested_model in self.models
 
 
 class RouteConfig(BaseModel):
@@ -82,6 +139,17 @@ class LoggingConfig(BaseModel):
     retention: str = "10 days"
 
 
+class AdminConfig(BaseModel):
+    enabled: bool = False
+    token: str | None = None
+
+    @model_validator(mode="after")
+    def validate_admin(self) -> "AdminConfig":
+        if self.enabled and not self.token:
+            raise ValueError("admin.token is required when admin.enabled=true")
+        return self
+
+
 class StorageConfig(BaseModel):
     backend: str = "sqlite"
     sqlite_path: str = "./data/llmpxy.db"
@@ -98,7 +166,9 @@ class AppConfig(BaseModel):
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    admin: AdminConfig = Field(default_factory=AdminConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    api_keys: list[ApiKeyConfig] = Field(default_factory=list)
     providers: list[ProviderConfig]
     provider_groups: list[ProviderGroupConfig] = Field(default_factory=list)
 
@@ -112,6 +182,13 @@ class AppConfig(BaseModel):
             raise ValueError("storage.file_dir is required for file backend")
         if not self.providers:
             raise ValueError("At least one provider must be configured")
+
+        api_key_names = [api_key.name for api_key in self.api_keys]
+        if len(set(api_key_names)) != len(api_key_names):
+            raise ValueError("API key names must be unique")
+        api_key_uuids = [api_key.uuid for api_key in self.api_keys]
+        if len(set(api_key_uuids)) != len(api_key_uuids):
+            raise ValueError("API key UUIDs must be unique")
 
         provider_names = [provider.name for provider in self.providers]
         if len(set(provider_names)) != len(provider_names):
@@ -136,11 +213,29 @@ class AppConfig(BaseModel):
                 raise ValueError(
                     f"Provider group {group.name!r} references unknown members: {missing}"
                 )
+            if group.model_whitelist_only and not group.models:
+                raise ValueError(
+                    f"Provider group {group.name!r} must declare models when model_whitelist_only=true"
+                )
 
         if self.route.type == "provider" and self.route.name not in set(provider_names):
             raise ValueError(f"route.name {self.route.name!r} does not match a provider")
         if self.route.type == "group" and self.route.name not in set(group_names):
             raise ValueError(f"route.name {self.route.name!r} does not match a provider group")
+
+        provider_name_set = set(provider_names)
+        group_name_set = set(group_names)
+        for api_key in self.api_keys:
+            unknown_providers = sorted(set(api_key.provider_limits_usd) - provider_name_set)
+            if unknown_providers:
+                raise ValueError(
+                    f"API key {api_key.name!r} references unknown providers: {unknown_providers}"
+                )
+            unknown_groups = sorted(set(api_key.group_limits_usd) - group_name_set)
+            if unknown_groups:
+                raise ValueError(
+                    f"API key {api_key.name!r} references unknown groups: {unknown_groups}"
+                )
 
         if self.retry.provider_error_threshold < 1:
             raise ValueError("retry.provider_error_threshold must be >= 1")

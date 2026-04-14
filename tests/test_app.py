@@ -166,6 +166,48 @@ def test_oaichat_endpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
+def test_group_model_whitelist_blocks_disallowed_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "group", "name": "default"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-4.1": "a-model"},
+                }
+            ],
+            "provider_groups": [
+                {
+                    "name": "default",
+                    "strategy": "fallback",
+                    "model_whitelist_only": True,
+                    "models": ["gpt-4.1"],
+                    "members": ["a"],
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "group-whitelist.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4.1-mini", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Requested model is not allowed by route"
+
+
 def test_anthropic_endpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("A_KEY", "a")
     monkeypatch.setenv("B_KEY", "b")
@@ -287,6 +329,8 @@ def test_oairesp_stream_exposes_reasoning_summary_from_oaichat(
 
     import httpx
 
+    captured_body: dict[str, object] = {}
+
     async def stream_success():
         first = json.dumps(
             {
@@ -315,6 +359,7 @@ def test_oairesp_stream_exposes_reasoning_summary_from_oaichat(
         yield b"data: [DONE]\n\n"
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content.decode("utf-8")))
         return httpx.Response(200, content=stream_success())
 
     original = httpx.AsyncClient
@@ -352,24 +397,27 @@ def test_oairesp_stream_exposes_reasoning_summary_from_oaichat(
             "input": "hi",
             "stream": True,
             "reasoning": {"effort": "high"},
+            "include": ["reasoning.encrypted_content"],
         },
     ) as response:
         assert response.status_code == 200
         body = "".join(response.iter_text())
 
+    assert "metadata" not in captured_body
     events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
     reasoning_added = next(
         event
         for event in events
-        if event["type"] == "response.output_item.added"
-        and event["item"]["type"] == "reasoning"
+        if event["type"] == "response.output_item.added" and event["item"]["type"] == "reasoning"
     )
     assert reasoning_added["item"]["summary"][0]["text"] == "internal reasoning summary"
+    assert reasoning_added["item"]["encrypted_content"] == "internal reasoning summary"
     completed = next(event for event in events if event["type"] == "response.completed")
     reasoning_item = next(
         item for item in completed["response"]["output"] if item["type"] == "reasoning"
     )
     assert reasoning_item["summary"][0]["text"] == "internal reasoning summary"
+    assert reasoning_item["encrypted_content"] == "internal reasoning summary"
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
@@ -2029,7 +2077,10 @@ def test_oairesp_exposes_reasoning_summary_in_response(
 
     import httpx
 
+    captured_body: dict[str, object] = {}
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content.decode("utf-8")))
         return httpx.Response(
             200,
             json={
@@ -2081,12 +2132,15 @@ def test_oairesp_exposes_reasoning_summary_in_response(
             "model": "gpt-5.4",
             "input": "hi",
             "reasoning": {"effort": "high", "summary": "auto"},
+            "include": ["reasoning.encrypted_content"],
         },
     )
 
     assert response.status_code == 200
+    assert "metadata" not in captured_body
     reasoning_item = next(item for item in response.json()["output"] if item["type"] == "reasoning")
     assert reasoning_item["summary"][0]["text"] == "internal reasoning summary"
+    assert reasoning_item["encrypted_content"] == "internal reasoning summary"
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 

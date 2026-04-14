@@ -9,6 +9,8 @@ dependencies = [
     "httpx>=0.28.0",
     "loguru>=0.7.3",
     "pydantic>=2.11.0",
+    "textual>=0.79.1",
+    "tomlkit>=0.13.2",
     "typer>=0.16.0",
     "uvicorn>=0.35.0",
 ]
