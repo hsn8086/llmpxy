@@ -1857,6 +1857,74 @@ def test_oaichat_preserves_reasoning_content_in_response(
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
+def test_oairesp_exposes_reasoning_summary_in_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_1",
+                "model": "a-model",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "ok",
+                            "reasoning_content": "internal reasoning summary",
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "a-model"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "oairesp-reasoning-content.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.4",
+            "input": "hi",
+        },
+    )
+
+    assert response.status_code == 200
+    reasoning_item = next(item for item in response.json()["output"] if item["type"] == "reasoning")
+    assert reasoning_item["summary"][0]["text"] == "internal reasoning summary"
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
 def test_oairesp_stream_history_function_calls_use_fc_item_ids(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -335,6 +335,19 @@ class OpenAIResponsesAdapter:
             ],
             "phase": "final_answer",
         }
+        if message.reasoning_content is not None:
+            output_items.append(
+                {
+                    "id": f"rs_{uuid.uuid4().hex}",
+                    "type": "reasoning",
+                    "summary": [
+                        {
+                            "type": "summary_text",
+                            "text": message.reasoning_content,
+                        }
+                    ],
+                }
+            )
         output_items.append(output_item)
 
         return {
