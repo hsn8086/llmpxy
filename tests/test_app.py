@@ -279,6 +279,100 @@ def test_oairesp_stream(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
+def test_oairesp_stream_exposes_reasoning_summary_from_oaichat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    async def stream_success():
+        first = json.dumps(
+            {
+                "id": "chat1",
+                "model": "a-model",
+                "choices": [
+                    {
+                        "delta": {
+                            "reasoning_content": "internal reasoning summary",
+                            "content": "ok",
+                        }
+                    }
+                ],
+            }
+        )
+        second = json.dumps(
+            {
+                "id": "chat1",
+                "model": "a-model",
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+        )
+        yield f"data: {first}\n\n".encode()
+        yield f"data: {second}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=stream_success())
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "a-model"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "oairesp-stream-reasoning.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={
+            "model": "gpt-5.4",
+            "input": "hi",
+            "stream": True,
+            "reasoning": {"effort": "high"},
+        },
+    ) as response:
+        assert response.status_code == 200
+        body = "".join(response.iter_text())
+
+    events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+    reasoning_added = next(
+        event
+        for event in events
+        if event["type"] == "response.output_item.added"
+        and event["item"]["type"] == "reasoning"
+    )
+    assert reasoning_added["item"]["summary"][0]["text"] == "internal reasoning summary"
+    completed = next(event for event in events if event["type"] == "response.completed")
+    reasoning_item = next(
+        item for item in completed["response"]["output"] if item["type"] == "reasoning"
+    )
+    assert reasoning_item["summary"][0]["text"] == "internal reasoning summary"
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
 def test_anthropic_stream_message_start_includes_usage() -> None:
     adapter = AnthropicAdapter()
     response = CanonicalResponse(
@@ -2218,6 +2312,76 @@ def test_oairesp_accepts_function_call_output_items(
     assert messages[0]["role"] == "tool"
     assert messages[0]["tool_call_id"] == "call_1"
     assert messages[0]["content"] == '{"status": "ok"}'
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+def test_oairesp_accepts_single_content_object_in_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    captured_body: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_1",
+                "model": "a-model",
+                "choices": [{"message": {"role": "assistant", "content": "done"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-4.1": "a-model"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "single-content-object.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-4.1",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": {"type": "input_text", "text": "hi"},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    messages = cast(list[dict[str, Any]], captured_body["messages"])
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"] == "hi"
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 

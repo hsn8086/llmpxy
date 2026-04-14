@@ -379,6 +379,16 @@ class OpenAIResponsesAdapter:
         created = response.created_at
         final_text = _extract_response_text(response)
         tool_calls = _extract_response_tool_calls(response)
+        message = (
+            response.output_messages[0]
+            if response.output_messages
+            else CanonicalMessage(role="assistant")
+        )
+        reasoning_text = (
+            message.reasoning_content
+            if response.metadata.get("reasoning_summary") is not None
+            else None
+        )
         message_id = f"msg_{uuid.uuid4().hex}"
         in_progress_item = {
             "id": message_id,
@@ -403,6 +413,18 @@ class OpenAIResponsesAdapter:
             ],
             "phase": "final_answer",
         }
+        reasoning_item = None
+        if reasoning_text is not None:
+            reasoning_item = {
+                "id": f"rs_{uuid.uuid4().hex}",
+                "type": "reasoning",
+                "summary": [
+                    {
+                        "type": "summary_text",
+                        "text": reasoning_text,
+                    }
+                ],
+            }
         sequence_number = 0
         event = {
             "type": "response.created",
@@ -494,11 +516,32 @@ class OpenAIResponsesAdapter:
             _log_stream_event(event)
             yield f"data: {json.dumps(event)}\n\n"
 
+        if reasoning_item is not None:
+            sequence_number += 1
+            event = {
+                "type": "response.output_item.added",
+                "sequence_number": sequence_number,
+                "output_index": len(tool_calls),
+                "item": reasoning_item,
+            }
+            _log_stream_event(event)
+            yield f"data: {json.dumps(event)}\n\n"
+            sequence_number += 1
+            event = {
+                "type": "response.output_item.done",
+                "sequence_number": sequence_number,
+                "output_index": len(tool_calls),
+                "item": reasoning_item,
+            }
+            _log_stream_event(event)
+            yield f"data: {json.dumps(event)}\n\n"
+
+        message_output_index = len(tool_calls) + (1 if reasoning_item is not None else 0)
         sequence_number += 1
         event = {
             "type": "response.output_item.added",
             "sequence_number": sequence_number,
-            "output_index": len(tool_calls),
+            "output_index": message_output_index,
             "item": in_progress_item,
         }
         _log_stream_event(event)
@@ -507,7 +550,7 @@ class OpenAIResponsesAdapter:
         event = {
             "type": "response.content_part.added",
             "sequence_number": sequence_number,
-            "output_index": len(tool_calls),
+            "output_index": message_output_index,
             "item_id": message_id,
             "content_index": 0,
             "part": {
@@ -526,7 +569,7 @@ class OpenAIResponsesAdapter:
             chunk_event = {
                 "type": "response.output_text.delta",
                 "sequence_number": sequence_number,
-                "output_index": len(tool_calls),
+                "output_index": message_output_index,
                 "item_id": message_id,
                 "content_index": 0,
                 "delta": event.delta,
@@ -538,7 +581,7 @@ class OpenAIResponsesAdapter:
         event = {
             "type": "response.output_text.done",
             "sequence_number": sequence_number,
-            "output_index": len(tool_calls),
+            "output_index": message_output_index,
             "item_id": message_id,
             "content_index": 0,
             "text": final_text,
@@ -550,7 +593,7 @@ class OpenAIResponsesAdapter:
         event = {
             "type": "response.content_part.done",
             "sequence_number": sequence_number,
-            "output_index": len(tool_calls),
+            "output_index": message_output_index,
             "item_id": message_id,
             "content_index": 0,
             "part": {
@@ -580,6 +623,7 @@ class OpenAIResponsesAdapter:
                     }
                     for tool_call in tool_calls
                 ],
+                *([reasoning_item] if reasoning_item is not None else []),
                 completed_item,
             ],
             "parallel_tool_calls": len(tool_calls) > 1,
@@ -596,7 +640,7 @@ class OpenAIResponsesAdapter:
         event = {
             "type": "response.output_item.done",
             "sequence_number": sequence_number,
-            "output_index": len(tool_calls),
+            "output_index": message_output_index,
             "item": completed_item,
         }
         _log_stream_event(event)
@@ -772,6 +816,11 @@ def _normalize_input(value: Any) -> list[CanonicalMessage]:
                 CanonicalMessage(
                     role=role, content=[CanonicalContentPart(type="text", text=content)]
                 )
+            )
+            continue
+        if isinstance(content, dict):
+            messages.append(
+                CanonicalMessage(role=role, content=_normalize_output_content([content]))
             )
             continue
         if isinstance(content, list):

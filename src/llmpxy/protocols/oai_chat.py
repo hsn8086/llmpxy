@@ -149,6 +149,7 @@ class OpenAIChatAdapter:
         item_id = f"msg_{uuid.uuid4().hex}"
         model = ""
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         active_tool_calls_by_index: dict[int, CanonicalToolCall] = {}
         tool_calls: list[CanonicalToolCall] = []
         usage = CanonicalUsage()
@@ -183,12 +184,19 @@ class OpenAIChatAdapter:
                         delta=text,
                     )
                 )
+            for text in _extract_reasoning_texts(delta):
+                reasoning_parts.append(text)
             for event in _extract_tool_call_events(
                 delta.get("tool_calls"),
                 active_tool_calls_by_index,
                 tool_calls,
             ):
                 events.append(event)
+
+            message = choice.get("message")
+            if isinstance(message, dict):
+                for text in _extract_reasoning_texts(message):
+                    reasoning_parts.append(text)
 
         response = CanonicalResponse(
             response_id=response_id,
@@ -200,6 +208,7 @@ class OpenAIChatAdapter:
                     role="assistant",
                     content=[CanonicalContentPart(type="text", text="".join(text_parts))],
                     tool_calls=tool_calls,
+                    reasoning_content="".join(reasoning_parts) or None,
                 )
             ],
             usage=usage,
@@ -512,6 +521,42 @@ def _extract_delta_texts(content: Any) -> list[str]:
                 texts.append(item["text"])
         return texts
     return []
+
+
+def _extract_reasoning_texts(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, list):
+        texts: list[str] = []
+        for item in value:
+            texts.extend(_extract_reasoning_texts(item))
+        return texts
+    if not isinstance(value, dict):
+        return []
+
+    direct_keys = (
+        "reasoning_content",
+        "reasoning",
+        "text",
+        "summary",
+        "summary_text",
+    )
+    texts: list[str] = []
+    for key in direct_keys:
+        item = value.get(key)
+        if isinstance(item, str) and item:
+            texts.append(item)
+        elif isinstance(item, list | dict):
+            texts.extend(_extract_reasoning_texts(item))
+
+    item_type = value.get("type")
+    if item_type in {"summary_text", "reasoning_text", "reasoning_content"} and isinstance(
+        value.get("text"), str
+    ):
+        text = value["text"]
+        if text and text not in texts:
+            texts.append(text)
+    return texts
 
 
 def _extract_tool_call_events(
