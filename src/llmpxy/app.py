@@ -562,11 +562,11 @@ def _stream_headers() -> dict[str, str]:
 def _can_passthrough_live_stream(
     inbound_protocol: ProtocolName, providers: list[ProviderConfig]
 ) -> bool:
-    if inbound_protocol != "oaichat":
+    if inbound_protocol not in {"oaichat", "anthropic"}:
         return False
     if len(providers) != 1:
         return False
-    return providers[0].protocol == "oaichat"
+    return providers[0].protocol == inbound_protocol
 
 
 async def _live_stream_passthrough(

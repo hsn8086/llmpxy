@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from llmpxy.config import AppConfig
-from llmpxy.proxy_client import post_json
+from llmpxy.proxy_client import _build_target_url, post_json
 
 
 @pytest.mark.asyncio
@@ -109,3 +109,24 @@ async def test_post_json_collects_output_items_from_sse_events(
         payload = await post_json(client, provider, "/responses", {"model": "gpt-5.4-mini"})
 
     assert payload["output"][0]["content"][0]["text"] == "你好！"
+
+
+def test_build_target_url_avoids_duplicate_v1_for_anthropic() -> None:
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "pneko"},
+            "providers": [
+                {
+                    "name": "pneko",
+                    "protocol": "anthropic",
+                    "base_url": "https://bridge.pulseneko.com/v1",
+                    "api_key_env": "PNEKO_API_KEY",
+                }
+            ],
+        }
+    )
+
+    assert (
+        _build_target_url(config.providers[0], "/v1/messages")
+        == "https://bridge.pulseneko.com/v1/messages"
+    )

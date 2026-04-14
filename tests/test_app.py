@@ -2643,6 +2643,134 @@ async def test_oaichat_stream_passthrough_emits_first_chunk_before_upstream_fini
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
+def test_oairesp_stream_passthrough_sets_anti_buffering_headers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    async def stream_success() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"response.created","response":{"id":"resp_1","model":"a-model"}}\n\n'
+        yield b'data: {"type":"response.completed","response":{"id":"resp_1","model":"a-model","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n'
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=stream_success(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oairesp",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "a-model"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "oairesp-live-stream.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={"model": "gpt-5.4", "input": "hi", "stream": True},
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["x-accel-buffering"] == "no"
+        assert response.headers["cache-control"] == "no-cache"
+        body = "".join(response.iter_text())
+
+    assert '"type": "response.created"' in body
+    assert '"type": "response.completed"' in body
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+def test_anthropic_stream_passthrough_sets_anti_buffering_headers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("B_KEY", "b")
+
+    import httpx
+
+    async def stream_success() -> AsyncIterator[bytes]:
+        yield b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-7-sonnet-latest","content":[]}}\n\n'
+        yield b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1,"output_tokens":1}}\n\n'
+        yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=stream_success(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "b"},
+            "providers": [
+                {
+                    "name": "b",
+                    "protocol": "anthropic",
+                    "base_url": "https://api.anthropic.com",
+                    "api_key_env": "B_KEY",
+                    "models": {"claude-sonnet": "claude-3-7-sonnet-latest"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "anthropic-live-stream.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    with client.stream(
+        "POST",
+        "/v1/messages",
+        json={
+            "model": "claude-sonnet",
+            "stream": True,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        },
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["x-accel-buffering"] == "no"
+        assert response.headers["cache-control"] == "no-cache"
+        body = "".join(response.iter_text())
+
+    assert "event: message_start" in body
+    assert "event: message_stop" in body
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
 def test_oairesp_ignores_reasoning_items_between_function_call_and_output(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

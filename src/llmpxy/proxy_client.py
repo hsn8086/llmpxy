@@ -64,6 +64,18 @@ def build_headers(provider: ProviderConfig) -> dict[str, str]:
     }
 
 
+def _build_target_url(provider: ProviderConfig, path: str) -> str:
+    base_url = provider.base_url.rstrip("/")
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    if (
+        provider.protocol == "anthropic"
+        and base_url.endswith("/v1")
+        and normalized_path.startswith("/v1/")
+    ):
+        normalized_path = normalized_path[3:]
+    return f"{base_url}{normalized_path}"
+
+
 async def post_json(
     client: httpx.AsyncClient,
     provider: ProviderConfig,
@@ -73,7 +85,7 @@ async def post_json(
     proxy = getattr(client, "_proxy", None)
     try:
         response = await client.post(
-            f"{provider.base_url.rstrip('/')}/{path.lstrip('/')}",
+            _build_target_url(provider, path),
             headers=build_headers(provider),
             json=payload,
             timeout=provider.timeout_seconds,
@@ -122,7 +134,7 @@ async def stream_lines(
     path: str,
     payload: dict[str, Any],
 ) -> AsyncIterator[str]:
-    target_url = f"{provider.base_url.rstrip('/')}/{path.lstrip('/')}"
+    target_url = _build_target_url(provider, path)
     proxy = getattr(client, "_proxy", None)
     try:
         async with client.stream(
