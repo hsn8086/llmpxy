@@ -641,6 +641,8 @@ def _normalize_reasoning(value: Any) -> dict[str, Any] | None:
         reasoning["effort"] = value["effort"]
     if isinstance(value.get("summary"), str):
         reasoning["summary"] = value["summary"]
+    if "summary" not in reasoning and "effort" in reasoning:
+        reasoning["summary"] = "auto"
     return reasoning or None
 
 

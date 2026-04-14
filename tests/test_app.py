@@ -1452,7 +1452,7 @@ def test_oairesp_forwards_reasoning_effort(
     )
 
     assert response.status_code == 200
-    assert captured_body["reasoning"] == {"effort": "high"}
+    assert captured_body["reasoning"] == {"effort": "high", "summary": "auto"}
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
@@ -1591,7 +1591,77 @@ def test_oairesp_maps_minimal_reasoning_effort_to_low(
     )
 
     assert response.status_code == 200
-    assert captured_body["reasoning"] == {"effort": "low"}
+    assert captured_body["reasoning"] == {"effort": "low", "summary": "auto"}
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+def test_oairesp_preserves_explicit_reasoning_summary_setting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    captured_body: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_1",
+                "model": "a-model",
+                "output": [
+                    {
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    }
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oairesp",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "a-model"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "oairesp-explicit-reasoning-summary.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.4",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "reasoning": {"effort": "high", "summary": "detailed"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured_body["reasoning"] == {"effort": "high", "summary": "detailed"}
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
@@ -1926,7 +1996,7 @@ def test_oairesp_exposes_reasoning_summary_in_response(
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
-def test_oairesp_omits_reasoning_summary_without_opt_in(
+def test_oairesp_defaults_reasoning_summary_to_auto(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1934,7 +2004,10 @@ def test_oairesp_omits_reasoning_summary_without_opt_in(
 
     import httpx
 
+    captured_body: dict[str, object] = {}
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content.decode("utf-8")))
         return httpx.Response(
             200,
             json={
@@ -1975,7 +2048,7 @@ def test_oairesp_omits_reasoning_summary_without_opt_in(
             ],
         }
     )
-    store = SQLiteConversationStore(tmp_path / "oairesp-no-reasoning-summary.db")
+    store = SQLiteConversationStore(tmp_path / "oairesp-default-reasoning-summary.db")
     dispatcher = ProviderDispatcher(config)
     app = create_app(config, store, dispatcher)
     client = TestClient(app)
@@ -1990,7 +2063,10 @@ def test_oairesp_omits_reasoning_summary_without_opt_in(
     )
 
     assert response.status_code == 200
-    assert all(item["type"] != "reasoning" for item in response.json()["output"])
+    assert captured_body["reasoning_effort"] == "high"
+    assert "reasoning" not in captured_body
+    reasoning_item = next(item for item in response.json()["output"] if item["type"] == "reasoning")
+    assert reasoning_item["summary"][0]["text"] == "internal reasoning summary"
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
