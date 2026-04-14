@@ -220,6 +220,15 @@ async def _handle_protocol_request(
             response, events, provider = await dispatcher.dispatch_stream(
                 canonical_request, request_id=request_id
             )
+            if inbound_protocol == "oairesp":
+                _save_conversation(
+                    store,
+                    adapter.format_response(response),
+                    response.model,
+                    response.output_messages,
+                    canonical_request.metadata,
+                    config.storage.ttl_seconds,
+                )
             log.info(
                 "stream request routed provider={} upstream_protocol={} mapped_model={}",
                 provider.name,
@@ -325,6 +334,15 @@ async def _handle_protocol_request_with_api_key(
                 request_id=request_id,
                 providers=selectable_providers,
             )
+            if inbound_protocol == "oairesp":
+                _save_conversation(
+                    store,
+                    adapter.format_response(response),
+                    response.model,
+                    response.output_messages,
+                    canonical_request.metadata,
+                    config.storage.ttl_seconds,
+                )
             runtime.record_usage(
                 api_key=api_key,
                 request_id=request_id,
