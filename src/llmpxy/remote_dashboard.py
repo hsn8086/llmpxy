@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, cast
 
 import httpx
+from textual.css.query import NoMatches
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import DataTable, Footer, Header, Input, Static
+from textual.widgets import DataTable, Footer, Header, Static
 
 
 @dataclass
@@ -66,16 +68,28 @@ class RemoteDashboardApp(App[None]):
         height: auto;
     }
 
-    #filter {
-        width: 1fr;
-    }
-
     #details {
         height: 8;
     }
 
     #alerts {
         height: 8;
+    }
+
+    #provider_details, #api_key_details {
+        height: 7;
+    }
+
+    .state-good {
+        color: $success;
+    }
+
+    .state-warn {
+        color: $warning;
+    }
+
+    .state-bad {
+        color: $error;
     }
 
     .panel-title {
@@ -98,32 +112,38 @@ class RemoteDashboardApp(App[None]):
         self._client = client
         self._enable_stream = enable_stream
         self._snapshot: dict[str, Any] = {}
+        self._snapshot_signature: str | None = None
         self._filter_text = ""
         self._provider_sort_mode = "health"
         self._api_key_sort_mode = "usage"
+        self._selected_provider_name: str | None = None
+        self._selected_api_key_uuid: str | None = None
         self._selected_recent_request_id: str | None = None
+        self._refresh_interval_seconds = 2.0
+        self._refresh_in_flight = False
+        self._snapshot_dirty = True
+        self._last_refresh_completed_at: float | None = None
+        self._force_refresh = False
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Horizontal(
-            Input(placeholder="Filter providers, keys, models, errors", id="filter"),
-            Static(
-                "p=provider sort  k=key sort  e=errors  a=clear  r=refresh  q=quit", id="controls"
-            ),
-            id="controls",
+        yield Static(
+            "p=provider sort  k=key sort  e=errors  a=clear  r=refresh  q=quit", id="controls"
         )
         yield Container(
             Horizontal(
                 Vertical(
                     Static("Providers", classes="panel-title"),
                     Static("Loading...", id="summary"),
-                    Static("No active alerts", id="alerts"),
+                    Static("No active alerts", id="alerts", classes="state-warn"),
                     DataTable(id="providers"),
+                    Static("No provider selected", id="provider_details"),
                     id="left",
                 ),
                 Vertical(
                     Static("API Keys", classes="panel-title"),
                     DataTable(id="api_keys"),
+                    Static("No API key selected", id="api_key_details"),
                     Static("Recent Requests", classes="panel-title"),
                     DataTable(id="recent"),
                     Static("No request selected", id="details"),
@@ -135,15 +155,45 @@ class RemoteDashboardApp(App[None]):
         yield Footer()
 
     async def on_mount(self) -> None:
-        self.query_one("#providers", DataTable).cursor_type = "row"
-        self.query_one("#api_keys", DataTable).cursor_type = "row"
-        self.query_one("#recent", DataTable).cursor_type = "row"
-        await self._load_snapshot()
+        providers_table = self.query_one("#providers", DataTable)
+        providers_table.cursor_type = "row"
+        providers_table.add_columns(
+            "Provider",
+            "Protocol",
+            "State",
+            "Errors",
+            "RecentOK",
+            "RecentErr",
+            "InFlight",
+            "LastError",
+        )
+
+        api_keys_table = self.query_one("#api_keys", DataTable)
+        api_keys_table.cursor_type = "row"
+        api_keys_table.add_columns(
+            "API Key", "State", "UUID", "Used", "Remaining", "Limit", "Usage"
+        )
+
+        recent_table = self.query_one("#recent", DataTable)
+        recent_table.cursor_type = "row"
+        recent_table.add_columns(
+            "Req",
+            "Started",
+            "Status",
+            "HTTP",
+            "Key",
+            "Provider",
+            "Model",
+            "Latency",
+            "Cost",
+            "Error",
+        )
+        self.run_worker(self._refresh_loop(), exclusive=True, group="dashboard-refresh")
         if self._enable_stream:
             self.run_worker(self._stream_events(), exclusive=True)
 
     async def action_refresh(self) -> None:
-        await self._load_snapshot()
+        self._request_refresh(force=True)
 
     def action_sort_providers(self) -> None:
         if self._provider_sort_mode == "health":
@@ -161,31 +211,64 @@ class RemoteDashboardApp(App[None]):
 
     def action_focus_errors(self) -> None:
         self._filter_text = "error"
-        self.query_one("#filter", Input).value = self._filter_text
         self._render_snapshot()
 
     def action_clear_filter(self) -> None:
         self._filter_text = ""
-        self.query_one("#filter", Input).value = ""
-        self._render_snapshot()
-
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id != "filter":
-            return
-        self._filter_text = event.value.strip().lower()
         self._render_snapshot()
 
     async def _load_snapshot(self) -> None:
-        self._snapshot = await self._client.snapshot()
+        self._refresh_in_flight = True
+        self._snapshot_dirty = False
+        try:
+            snapshot = await self._client.snapshot()
+        except Exception:
+            self._snapshot_dirty = True
+            raise
+        finally:
+            self._last_refresh_completed_at = time.monotonic()
+            self._refresh_in_flight = False
+        snapshot_signature = self._snapshot_signature_for(snapshot)
+        if snapshot_signature == self._snapshot_signature:
+            return
+        self._snapshot = snapshot
+        self._snapshot_signature = snapshot_signature
         self._render_snapshot()
+
+    def _request_refresh(self, *, force: bool = False) -> None:
+        self._snapshot_dirty = True
+        if force:
+            self._force_refresh = True
+
+    @staticmethod
+    def _snapshot_signature_for(snapshot: dict[str, Any]) -> str:
+        return json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+    async def _refresh_loop(self) -> None:
+        while True:
+            should_refresh = self._snapshot_dirty and not self._refresh_in_flight
+            interval_elapsed = self._last_refresh_completed_at is None or (
+                time.monotonic() - self._last_refresh_completed_at >= self._refresh_interval_seconds
+            )
+            if should_refresh and (self._force_refresh or interval_elapsed):
+                try:
+                    self._force_refresh = False
+                    await self._load_snapshot()
+                except Exception:
+                    await asyncio.sleep(self._refresh_interval_seconds)
+                    continue
+            await asyncio.sleep(0.1)
 
     def _render_snapshot(self) -> None:
         summary = self.query_one("#summary", Static)
         alerts_widget = self.query_one("#alerts", Static)
+        provider_details = self.query_one("#provider_details", Static)
+        api_key_details = self.query_one("#api_key_details", Static)
         details = self.query_one("#details", Static)
         route = self._snapshot.get("route", {})
         reload = self._snapshot.get("reload", {})
         window = self._snapshot.get("window", {})
+        windows = self._snapshot.get("windows", {})
         providers = list(self._snapshot.get("providers", []))
         api_keys = list(self._snapshot.get("api_keys", []))
         recent_requests = list(self._snapshot.get("recent_requests", []))
@@ -207,7 +290,10 @@ class RemoteDashboardApp(App[None]):
                     f"Route: {route.get('type', '-')}/{route.get('name', '-')}",
                     f"Storage: {self._snapshot.get('storage_backend', '-')}",
                     f"Revision: {reload.get('current_revision', '-')}",
+                    f"Filter: {self._filter_text or '-'}  ProviderSort: {self._provider_sort_mode}  KeySort: {self._api_key_sort_mode}",
                     f"Window(60s): req={window.get('request_count', 0)} tps={self._format_float(window.get('tps'), 2)} err_rate={self._format_percent(window.get('error_rate'))} avg_latency={self._format_latency(window.get('avg_latency_ms'))}",
+                    f"Window(10s): tps={self._window_value(windows, '10s', 'tps')} success_tps={self._window_value(windows, '10s', 'success_tps')} error_tps={self._window_value(windows, '10s', 'error_tps')}",
+                    f"Window(5m): req={self._window_value(windows, '5m', 'request_count', integer=True)} p95={self._window_latency(windows, '5m', 'p95_latency_ms')} tokens={self._window_value(windows, '5m', 'total_tokens', integer=True)} cost=${self._window_value(windows, '5m', 'total_cost_usd')}",
                     f"Providers: total={len(providers)} healthy={healthy_provider_count} failing={failing_provider_count}",
                     f"API Keys: total={len(api_keys)} enabled={enabled_key_count}",
                     f"Recent Requests: total={len(recent_requests)} success={success_request_count} errors={error_request_count} cost=${total_recent_cost:.4f}",
@@ -220,19 +306,13 @@ class RemoteDashboardApp(App[None]):
             alert for alert in self._snapshot.get("alerts", []) if self._matches_filter(alert)
         ]
         alerts_widget.update(self._render_alerts(alerts))
+        alerts_widget.set_class(bool(alerts), "state-warn")
+        alerts_widget.set_class(
+            any(self._is_critical_alert(alert) for alert in alerts), "state-bad"
+        )
 
         providers = self.query_one("#providers", DataTable)
-        providers.clear(columns=True)
-        providers.add_columns(
-            "Provider",
-            "Protocol",
-            "State",
-            "Errors",
-            "RecentOK",
-            "RecentErr",
-            "InFlight",
-            "LastError",
-        )
+        providers.clear()
         provider_rows = [
             provider
             for provider in self._snapshot.get("providers", [])
@@ -249,11 +329,33 @@ class RemoteDashboardApp(App[None]):
                 str(provider.get("recent_errors", 0)),
                 str(provider.get("in_flight", 0)),
                 self._truncate(str(provider.get("last_error_message") or "-"), 36),
+                key=str(provider.get("name", "-")),
             )
+        selected_provider = self._find_selected_item(
+            provider_rows,
+            self._selected_provider_name,
+            lambda item: str(item.get("name", "-")),
+        )
+        if selected_provider is not None:
+            self._selected_provider_name = str(selected_provider.get("name", "-"))
+        else:
+            self._selected_provider_name = None
+        provider_details.update(self._render_provider_details(selected_provider))
+        provider_details.set_class(
+            bool(selected_provider and str(selected_provider.get("state", "")) == "healthy"),
+            "state-good",
+        )
+        provider_details.set_class(
+            bool(selected_provider and str(selected_provider.get("state", "")) == "degraded"),
+            "state-warn",
+        )
+        provider_details.set_class(
+            bool(selected_provider and str(selected_provider.get("state", "")) == "failing"),
+            "state-bad",
+        )
 
         api_keys = self.query_one("#api_keys", DataTable)
-        api_keys.clear(columns=True)
-        api_keys.add_columns("API Key", "State", "UUID", "Used", "Remaining", "Limit", "Usage")
+        api_keys.clear()
         api_key_rows = [
             api_key
             for api_key in self._snapshot.get("api_keys", [])
@@ -274,17 +376,38 @@ class RemoteDashboardApp(App[None]):
                 self._format_budget_value(api_key.get("remaining_usd")),
                 self._format_budget_value(api_key.get("limit_usd")),
                 usage_display,
+                key=str(api_key.get("uuid", "-")),
             )
+        selected_api_key = self._find_selected_item(
+            api_key_rows,
+            self._selected_api_key_uuid,
+            lambda item: str(item.get("uuid", "-")),
+        )
+        if selected_api_key is not None:
+            self._selected_api_key_uuid = str(selected_api_key.get("uuid", "-"))
+        else:
+            self._selected_api_key_uuid = None
+        api_key_details.update(self._render_api_key_details(selected_api_key))
+        api_key_details.set_class(
+            bool(selected_api_key and not bool(selected_api_key.get("enabled", True))),
+            "state-warn",
+        )
+        api_key_details.set_class(
+            bool(
+                selected_api_key
+                and isinstance(selected_api_key.get("utilization_ratio"), int | float)
+                and float(selected_api_key.get("utilization_ratio") or 0.0) >= 1.0
+            ),
+            "state-bad",
+        )
 
         recent = self.query_one("#recent", DataTable)
-        recent.clear(columns=True)
-        recent.add_columns(
-            "Req", "Status", "HTTP", "Key", "Provider", "Model", "Latency", "Cost", "Error"
-        )
+        recent.clear()
         filtered_recent_requests = [item for item in recent_requests if self._matches_filter(item)]
         for item in filtered_recent_requests:
             recent.add_row(
                 str(item.get("request_id", "-"))[:8],
+                self._format_timestamp(item.get("started_at")),
                 str(item.get("status", "-")),
                 str(item.get("http_status", "-")),
                 str(item.get("api_key_name", "-")),
@@ -295,40 +418,131 @@ class RemoteDashboardApp(App[None]):
                 self._truncate(str(item.get("error_message") or item.get("error_code") or "-"), 40),
                 key=str(item.get("request_id", "-")),
             )
-        if filtered_recent_requests:
-            request_ids = {str(item.get("request_id", "-")) for item in filtered_recent_requests}
-            if self._selected_recent_request_id not in request_ids:
-                self._selected_recent_request_id = str(
-                    filtered_recent_requests[0].get("request_id", "-")
-                )
+        selected_request = self._find_selected_item(
+            filtered_recent_requests,
+            self._selected_recent_request_id,
+            lambda item: str(item.get("request_id", "-")),
+        )
+        if selected_request is not None:
+            self._selected_recent_request_id = str(selected_request.get("request_id", "-"))
         else:
             self._selected_recent_request_id = None
-        selected_request = self._find_selected_request(filtered_recent_requests)
         details.update(self._render_request_details(selected_request))
+        details.set_class(
+            bool(selected_request and str(selected_request.get("status", "")) == "success"),
+            "state-good",
+        )
+        details.set_class(
+            bool(
+                selected_request
+                and str(selected_request.get("status", "")) in {"provider_error", "all_failed"}
+            ),
+            "state-bad",
+        )
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        if event.data_table.id != "recent":
-            return
         row_key = event.row_key.value
         if not isinstance(row_key, str):
             return
-        self._selected_recent_request_id = row_key
-        recent_requests = list(self._snapshot.get("recent_requests", []))
-        filtered_recent_requests = [item for item in recent_requests if self._matches_filter(item)]
-        request = self._find_selected_request(filtered_recent_requests)
-        self.query_one("#details", Static).update(self._render_request_details(request))
+        if event.data_table.id == "recent":
+            self._selected_recent_request_id = row_key
+            recent_requests = list(self._snapshot.get("recent_requests", []))
+            filtered_recent_requests = [
+                item for item in recent_requests if self._matches_filter(item)
+            ]
+            selected_request = self._find_selected_item(
+                filtered_recent_requests,
+                self._selected_recent_request_id,
+                lambda item: str(item.get("request_id", "-")),
+            )
+            details = self.query_one("#details", Static)
+            details.update(self._render_request_details(selected_request))
+            details.set_class(
+                bool(selected_request and str(selected_request.get("status", "")) == "success"),
+                "state-good",
+            )
+            details.set_class(
+                bool(
+                    selected_request
+                    and str(selected_request.get("status", "")) in {"provider_error", "all_failed"}
+                ),
+                "state-bad",
+            )
+        elif event.data_table.id == "providers":
+            self._selected_provider_name = row_key
+            provider_rows = [
+                provider
+                for provider in self._snapshot.get("providers", [])
+                if self._matches_filter(provider)
+            ]
+            provider_rows.sort(key=self._provider_sort_key)
+            selected_provider = self._find_selected_item(
+                provider_rows,
+                self._selected_provider_name,
+                lambda item: str(item.get("name", "-")),
+            )
+            provider_details = self.query_one("#provider_details", Static)
+            provider_details.update(self._render_provider_details(selected_provider))
+            provider_details.set_class(
+                bool(selected_provider and str(selected_provider.get("state", "")) == "healthy"),
+                "state-good",
+            )
+            provider_details.set_class(
+                bool(selected_provider and str(selected_provider.get("state", "")) == "degraded"),
+                "state-warn",
+            )
+            provider_details.set_class(
+                bool(selected_provider and str(selected_provider.get("state", "")) == "failing"),
+                "state-bad",
+            )
+        elif event.data_table.id == "api_keys":
+            self._selected_api_key_uuid = row_key
+            api_key_rows = [
+                api_key
+                for api_key in self._snapshot.get("api_keys", [])
+                if self._matches_filter(api_key)
+            ]
+            api_key_rows.sort(key=self._api_key_sort_key)
+            selected_api_key = self._find_selected_item(
+                api_key_rows,
+                self._selected_api_key_uuid,
+                lambda item: str(item.get("uuid", "-")),
+            )
+            api_key_details = self.query_one("#api_key_details", Static)
+            api_key_details.update(self._render_api_key_details(selected_api_key))
+            api_key_details.set_class(
+                bool(selected_api_key and not bool(selected_api_key.get("enabled", True))),
+                "state-warn",
+            )
+            api_key_details.set_class(
+                bool(
+                    selected_api_key
+                    and isinstance(selected_api_key.get("utilization_ratio"), int | float)
+                    and float(selected_api_key.get("utilization_ratio") or 0.0) >= 1.0
+                ),
+                "state-bad",
+            )
+        else:
+            return
+        try:
+            self.refresh(layout=False)
+        except NoMatches:
+            return
 
-    def _find_selected_request(
-        self, recent_requests: list[dict[str, Any]]
+    def _find_selected_item(
+        self,
+        items: list[dict[str, Any]],
+        selected_key: str | None,
+        get_key: Callable[[dict[str, Any]], str],
     ) -> dict[str, Any] | None:
-        if not recent_requests:
+        if not items:
             return None
-        if self._selected_recent_request_id is None:
-            return recent_requests[0]
-        for request in recent_requests:
-            if str(request.get("request_id", "-")) == self._selected_recent_request_id:
-                return request
-        return recent_requests[0]
+        if selected_key is None:
+            return items[0]
+        for item in items:
+            if get_key(item) == selected_key:
+                return item
+        return items[0]
 
     def _render_alerts(self, alerts: list[dict[str, Any]]) -> str:
         if not alerts:
@@ -341,6 +555,44 @@ class RemoteDashboardApp(App[None]):
         if len(alerts) > 5:
             lines.append(f"... and {len(alerts) - 5} more alerts")
         return "\n".join(lines)
+
+    @staticmethod
+    def _is_critical_alert(alert: dict[str, Any]) -> bool:
+        return str(alert.get("severity", "")).lower() in {"critical", "failing"}
+
+    def _render_provider_details(self, provider: dict[str, Any] | None) -> str:
+        if provider is None:
+            return "No provider selected"
+        return "\n".join(
+            [
+                f"Provider: {provider.get('name', '-')}",
+                f"Protocol: {provider.get('protocol', '-')}  State: {provider.get('state', '-')}",
+                f"Errors: consecutive={provider.get('consecutive_errors', 0)} recent={provider.get('recent_errors', 0)}",
+                f"Success: recent={provider.get('recent_successes', 0)}  InFlight: {provider.get('in_flight', 0)}",
+                f"Window(60s): req={provider.get('window', {}).get('request_count', 0)} tps={self._format_float(provider.get('window', {}).get('tps'), 2)} err_rate={self._format_percent(provider.get('window', {}).get('error_rate'))}",
+                f"Window(60s): avg_latency={self._format_latency(provider.get('window', {}).get('avg_latency_ms'))} cost=${self._format_float(provider.get('window', {}).get('total_cost_usd'), 4)}",
+                f"Last Success: {self._format_timestamp(provider.get('last_success_at'))}",
+                f"Last Error: {provider.get('last_error_message') or '-'}",
+            ]
+        )
+
+    def _render_api_key_details(self, api_key: dict[str, Any] | None) -> str:
+        if api_key is None:
+            return "No API key selected"
+        utilization_ratio = api_key.get("utilization_ratio")
+        usage = "-"
+        if isinstance(utilization_ratio, int | float):
+            usage = f"{float(utilization_ratio) * 100:.0f}%"
+        return "\n".join(
+            [
+                f"API Key: {api_key.get('name', '-')}",
+                f"UUID: {api_key.get('uuid', '-')}",
+                f"State: {'enabled' if api_key.get('enabled', True) else 'disabled'}  Usage: {usage}",
+                f"Used: ${float(api_key.get('used_usd', 0.0) or 0.0):.4f}",
+                f"Remaining: {self._format_budget_value(api_key.get('remaining_usd'))}",
+                f"Limit: {self._format_budget_value(api_key.get('limit_usd'))}",
+            ]
+        )
 
     @staticmethod
     def _format_budget_value(value: object | None) -> str:
@@ -387,6 +639,37 @@ class RemoteDashboardApp(App[None]):
         if isinstance(value, int | float):
             return f"{float(value) * 100:.1f}%"
         return "-"
+
+    def _window_value(
+        self, windows: object, window_name: str, key: str, *, integer: bool = False
+    ) -> str:
+        if not isinstance(windows, dict):
+            return "-"
+        window_map = cast(dict[str, object], windows)
+        window = window_map.get(window_name)
+        if not isinstance(window, dict):
+            return "-"
+        value = cast(dict[str, object], window).get(key)
+        if isinstance(value, int | float):
+            if integer:
+                return str(int(value))
+            return self._format_float(value, 2)
+        return "-"
+
+    def _window_latency(self, windows: object, window_name: str, key: str) -> str:
+        if not isinstance(windows, dict):
+            return "-"
+        window_map = cast(dict[str, object], windows)
+        window = window_map.get(window_name)
+        if not isinstance(window, dict):
+            return "-"
+        return self._format_latency(cast(dict[str, object], window).get(key))
+
+    @staticmethod
+    def _format_timestamp(value: object | None) -> str:
+        if not isinstance(value, int | float):
+            return "-"
+        return time.strftime("%H:%M:%S", time.localtime(int(value)))
 
     def _provider_sort_key(self, provider: dict[str, Any]) -> tuple[object, ...]:
         if self._provider_sort_mode == "errors":
@@ -448,7 +731,7 @@ class RemoteDashboardApp(App[None]):
         while True:
             try:
                 async for _event_type, _payload in self._client.stream():
-                    await self._load_snapshot()
+                    self._request_refresh()
             except Exception:
                 await asyncio.sleep(1.0)
 

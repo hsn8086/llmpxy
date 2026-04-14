@@ -161,29 +161,20 @@ class RuntimeManager:
     def runtime_snapshot(self) -> dict[str, object]:
         state = self.current()
         now = int(time.time())
-        recent_window_seconds = 60
-        window_started_at = now - recent_window_seconds
-        recent_window_requests = state.store.list_request_events_since(window_started_at)
         recent_requests = state.store.list_recent_request_events(20)
-        request_count = len(recent_window_requests)
-        success_count = sum(1 for item in recent_window_requests if item.status == "success")
-        error_count = request_count - success_count
-        total_cost_usd = sum(item.cost_usd for item in recent_window_requests)
-        latency_values = [
-            item.latency_ms for item in recent_window_requests if item.latency_ms is not None
-        ]
-        avg_latency_ms = None
-        if latency_values:
-            avg_latency_ms = int(sum(latency_values) / len(latency_values))
-        tps = request_count / recent_window_seconds
-        error_rate = 0.0
-        if request_count > 0:
-            error_rate = error_count / request_count
+        recent_window_seconds = 60
+        windows = {
+            "10s": self._window_snapshot(state, now, 10),
+            "60s": self._window_snapshot(state, now, 60),
+            "5m": self._window_snapshot(state, now, 300),
+        }
+        window_snapshot = windows["60s"]
         provider_snapshots = []
         provider_alerts: list[dict[str, object]] = []
         for provider in state.config.providers:
             provider_stats = self._stats.ensure_provider(provider.name)
             provider_state = self._stats.provider_state(provider.name)
+            provider_window = self._provider_window_snapshot(state, now, provider.name, 60)
             provider_snapshots.append(
                 {
                     "name": provider.name,
@@ -196,6 +187,7 @@ class RuntimeManager:
                     "in_flight": provider_stats.in_flight,
                     "recent_successes": provider_stats.recent_successes,
                     "recent_errors": provider_stats.recent_errors,
+                    "window": provider_window,
                 }
             )
             if provider_state in {"failing", "degraded"}:
@@ -260,19 +252,79 @@ class RuntimeManager:
                 "last_error": self._stats.reload.last_error,
             },
             "window": {
+                **window_snapshot,
                 "seconds": recent_window_seconds,
-                "request_count": request_count,
-                "success_count": success_count,
-                "error_count": error_count,
-                "error_rate": error_rate,
-                "tps": tps,
-                "total_cost_usd": total_cost_usd,
-                "avg_latency_ms": avg_latency_ms,
             },
+            "windows": windows,
             "providers": provider_snapshots,
             "api_keys": api_key_balances,
             "alerts": alerts,
             "recent_requests": [item.model_dump(mode="json") for item in recent_requests],
+        }
+
+    def _window_snapshot(self, state: RuntimeState, now: int, seconds: int) -> dict[str, object]:
+        window_started_at = now - seconds
+        window_requests = state.store.list_request_events_since(window_started_at)
+        request_count = len(window_requests)
+        success_count = sum(1 for item in window_requests if item.status == "success")
+        error_count = request_count - success_count
+        total_cost_usd = sum(item.cost_usd for item in window_requests)
+        total_tokens = sum(item.total_tokens or 0 for item in window_requests)
+        latency_values = [
+            item.latency_ms for item in window_requests if item.latency_ms is not None
+        ]
+        avg_latency_ms = None
+        p95_latency_ms = None
+        if latency_values:
+            avg_latency_ms = int(sum(latency_values) / len(latency_values))
+            sorted_latencies = sorted(latency_values)
+            index = max(0, int(len(sorted_latencies) * 0.95) - 1)
+            p95_latency_ms = sorted_latencies[index]
+        error_rate = 0.0
+        if request_count > 0:
+            error_rate = error_count / request_count
+        return {
+            "request_count": request_count,
+            "success_count": success_count,
+            "error_count": error_count,
+            "error_rate": error_rate,
+            "tps": request_count / seconds,
+            "success_tps": success_count / seconds,
+            "error_tps": error_count / seconds,
+            "total_cost_usd": total_cost_usd,
+            "avg_latency_ms": avg_latency_ms,
+            "p95_latency_ms": p95_latency_ms,
+            "total_tokens": total_tokens,
+        }
+
+    def _provider_window_snapshot(
+        self, state: RuntimeState, now: int, provider_name: str, seconds: int
+    ) -> dict[str, object]:
+        window_started_at = now - seconds
+        requests = [
+            item
+            for item in state.store.list_request_events_since(window_started_at)
+            if item.provider_name == provider_name
+        ]
+        request_count = len(requests)
+        success_count = sum(1 for item in requests if item.status == "success")
+        error_count = request_count - success_count
+        avg_latency_ms = None
+        latency_values = [item.latency_ms for item in requests if item.latency_ms is not None]
+        if latency_values:
+            avg_latency_ms = int(sum(latency_values) / len(latency_values))
+        error_rate = 0.0
+        if request_count > 0:
+            error_rate = error_count / request_count
+        return {
+            "seconds": seconds,
+            "request_count": request_count,
+            "success_count": success_count,
+            "error_count": error_count,
+            "error_rate": error_rate,
+            "tps": request_count / seconds,
+            "avg_latency_ms": avg_latency_ms,
+            "total_cost_usd": sum(item.cost_usd for item in requests),
         }
 
     def masked_config(self) -> dict[str, object]:

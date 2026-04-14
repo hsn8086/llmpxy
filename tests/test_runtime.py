@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastapi import HTTPException
@@ -308,8 +309,11 @@ api_key_env = "UPSTREAM_A_KEY"
     )
 
     snapshot = runtime.runtime_snapshot()
-    window = snapshot["window"]
-    alerts = snapshot["alerts"]
+    window = cast(dict[str, object], snapshot["window"])
+    windows = cast(dict[str, dict[str, object]], snapshot["windows"])
+    providers = cast(list[dict[str, object]], snapshot["providers"])
+    provider = providers[0]
+    alerts = cast(list[dict[str, object]], snapshot["alerts"])
 
     assert window == {
         "seconds": 60,
@@ -318,8 +322,26 @@ api_key_env = "UPSTREAM_A_KEY"
         "error_count": 1,
         "error_rate": 0.5,
         "tps": 2 / 60,
+        "success_tps": 1 / 60,
+        "error_tps": 1 / 60,
         "total_cost_usd": 1.0,
         "avg_latency_ms": 1000,
+        "p95_latency_ms": 500,
+        "total_tokens": 0,
+    }
+    assert windows["10s"]["request_count"] == 1
+    assert windows["60s"]["request_count"] == 2
+    assert windows["5m"]["request_count"] == 3
+    assert windows["5m"]["total_cost_usd"] == 6.0
+    assert provider["window"] == {
+        "seconds": 60,
+        "request_count": 2,
+        "success_count": 1,
+        "error_count": 1,
+        "error_rate": 0.5,
+        "tps": 2 / 60,
+        "avg_latency_ms": 1000,
+        "total_cost_usd": 1.0,
     }
     assert alerts == [
         {
