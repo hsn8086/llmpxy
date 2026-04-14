@@ -45,6 +45,7 @@ class SQLiteConversationStore:
                     requested_model TEXT NOT NULL,
                     upstream_model TEXT NOT NULL,
                     input_tokens INTEGER NOT NULL,
+                    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL,
                     total_tokens INTEGER NOT NULL,
                     cost_usd REAL NOT NULL,
@@ -71,18 +72,30 @@ class SQLiteConversationStore:
                     error_code TEXT,
                     error_message TEXT,
                     input_tokens INTEGER NOT NULL,
+                    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL,
                     total_tokens INTEGER NOT NULL,
                     cost_usd REAL NOT NULL
                 )
                 """
             )
-            columns = {
+            usage_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(api_key_usage)").fetchall()
             }
-            if "api_key_uuid" not in columns:
+            if "api_key_uuid" not in usage_columns:
                 connection.execute(
                     "ALTER TABLE api_key_usage ADD COLUMN api_key_uuid TEXT NOT NULL DEFAULT ''"
+                )
+            if "cached_input_tokens" not in usage_columns:
+                connection.execute(
+                    "ALTER TABLE api_key_usage ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0"
+                )
+            request_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(request_events)").fetchall()
+            }
+            if "cached_input_tokens" not in request_columns:
+                connection.execute(
+                    "ALTER TABLE request_events ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0"
                 )
 
     def get(self, response_id: str) -> StoredConversation | None:
@@ -168,11 +181,12 @@ class SQLiteConversationStore:
                     requested_model,
                     upstream_model,
                     input_tokens,
+                    cached_input_tokens,
                     output_tokens,
                     total_tokens,
                     cost_usd,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.request_id,
@@ -182,6 +196,7 @@ class SQLiteConversationStore:
                     record.requested_model,
                     record.upstream_model,
                     record.input_tokens,
+                    record.cached_input_tokens,
                     record.output_tokens,
                     record.total_tokens,
                     record.cost_usd,
@@ -210,10 +225,11 @@ class SQLiteConversationStore:
                     error_code,
                     error_message,
                     input_tokens,
+                    cached_input_tokens,
                     output_tokens,
                     total_tokens,
                     cost_usd
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.request_id,
@@ -232,6 +248,7 @@ class SQLiteConversationStore:
                     record.error_code,
                     record.error_message,
                     record.input_tokens,
+                    record.cached_input_tokens,
                     record.output_tokens,
                     record.total_tokens,
                     record.cost_usd,
@@ -278,6 +295,7 @@ def _request_event_from_row(row: sqlite3.Row) -> RequestEventRecord:
         error_code=row["error_code"],
         error_message=row["error_message"],
         input_tokens=row["input_tokens"],
+        cached_input_tokens=row["cached_input_tokens"],
         output_tokens=row["output_tokens"],
         total_tokens=row["total_tokens"],
         cost_usd=float(row["cost_usd"]),

@@ -2852,6 +2852,23 @@ def test_oaichat_parse_response_reads_cached_prompt_tokens() -> None:
     assert response.usage.output_tokens == 25
 
 
+def test_oaichat_build_request_includes_stream_usage_option() -> None:
+    adapter = OpenAIChatAdapter()
+
+    request = adapter.parse_request(
+        {
+            "model": "gpt-5.4",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        strip_unsupported_fields=True,
+    )
+
+    _path, payload = adapter.build_request(request, "gpt-5.4")
+
+    assert payload["stream_options"] == {"include_usage": True}
+
+
 @pytest.mark.asyncio
 async def test_oairesp_parse_stream_reads_cached_input_tokens() -> None:
     from llmpxy.protocols.oai_responses import OpenAIResponsesAdapter

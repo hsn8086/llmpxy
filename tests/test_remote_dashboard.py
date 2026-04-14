@@ -131,6 +131,9 @@ async def test_remote_dashboard_renders_snapshot() -> None:
                     "error_rate": 0.0,
                     "tps": 0.02,
                     "avg_latency_ms": 320,
+                    "total_input_tokens": 1200,
+                    "total_cached_input_tokens": 300,
+                    "total_output_tokens": 150,
                     "total_cost_usd": 0.5,
                 },
             },
@@ -151,6 +154,9 @@ async def test_remote_dashboard_renders_snapshot() -> None:
                     "error_rate": 1.0,
                     "tps": 0.02,
                     "avg_latency_ms": 2100,
+                    "total_input_tokens": 0,
+                    "total_cached_input_tokens": 0,
+                    "total_output_tokens": 0,
                     "total_cost_usd": 0.0,
                 },
             },
@@ -198,6 +204,10 @@ async def test_remote_dashboard_renders_snapshot() -> None:
                 "status": "provider_error",
                 "http_status": 502,
                 "latency_ms": 2100,
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
                 "cost_usd": 0.0,
                 "error_message": "upstream timeout after retry loop",
             },
@@ -209,6 +219,10 @@ async def test_remote_dashboard_renders_snapshot() -> None:
                 "status": "success",
                 "http_status": 200,
                 "latency_ms": 320,
+                "input_tokens": 1200,
+                "cached_input_tokens": 300,
+                "output_tokens": 150,
+                "total_tokens": 1350,
                 "cost_usd": 0.5,
                 "error_message": None,
             },
@@ -241,6 +255,7 @@ async def test_remote_dashboard_renders_snapshot() -> None:
         assert "State: failing" in rendered_provider_details
         assert "Window(60s): req=1 tps=0.02 err_rate=100.0%" in rendered_provider_details
         assert "Window(60s): avg_latency=2100ms cost=$0.0000" in rendered_provider_details
+        assert "Window(60s): in=0 cached=0 out=0" in rendered_provider_details
         assert provider_details.has_class("state-bad")
 
         alerts = app.query_one("#alerts", Static)
@@ -264,12 +279,16 @@ async def test_remote_dashboard_renders_snapshot() -> None:
         recent = app.query_one("#recent", DataTable)
         assert recent.row_count == 2
         assert recent.get_row_at(0)[2] == "provider_error"
-        assert recent.get_row_at(0)[7] == "2100ms"
-        assert recent.get_row_at(0)[9] == "upstream timeout after retry loop"
+        assert recent.get_row_at(0)[7] == "0"
+        assert recent.get_row_at(0)[8] == "0"
+        assert recent.get_row_at(0)[9] == "0"
+        assert recent.get_row_at(0)[10] == "2100ms"
+        assert recent.get_row_at(0)[12] == "upstream timeout after retry loop"
 
         details = app.query_one("#details", Static)
         rendered_details = str(details.render())
         assert "Request: req-1" in rendered_details
+        assert "Tokens: in=0 cached=0 out=0 total=0" in rendered_details
         assert "Error: upstream timeout after retry loop" in rendered_details
         assert details.has_class("state-bad")
 
@@ -353,6 +372,9 @@ async def test_remote_dashboard_filter_and_sort_actions() -> None:
                     "error_rate": 0.0,
                     "tps": 0.02,
                     "avg_latency_ms": 100,
+                    "total_input_tokens": 100,
+                    "total_cached_input_tokens": 20,
+                    "total_output_tokens": 10,
                     "total_cost_usd": 1.0,
                 },
             },
@@ -373,6 +395,9 @@ async def test_remote_dashboard_filter_and_sort_actions() -> None:
                     "error_rate": 0.5,
                     "tps": 0.03,
                     "avg_latency_ms": 500,
+                    "total_input_tokens": 200,
+                    "total_cached_input_tokens": 40,
+                    "total_output_tokens": 30,
                     "total_cost_usd": 0.5,
                 },
             },
@@ -539,6 +564,9 @@ async def test_remote_dashboard_updates_provider_and_api_key_details_when_rows_s
                     "error_rate": 1.0,
                     "tps": 0.02,
                     "avg_latency_ms": 700,
+                    "total_input_tokens": 50,
+                    "total_cached_input_tokens": 10,
+                    "total_output_tokens": 5,
                     "total_cost_usd": 0.0,
                 },
             },
@@ -560,6 +588,9 @@ async def test_remote_dashboard_updates_provider_and_api_key_details_when_rows_s
                     "error_rate": 0.0,
                     "tps": 0.02,
                     "avg_latency_ms": 100,
+                    "total_input_tokens": 80,
+                    "total_cached_input_tokens": 20,
+                    "total_output_tokens": 15,
                     "total_cost_usd": 0.5,
                 },
             },
@@ -697,6 +728,10 @@ async def test_remote_dashboard_updates_details_when_recent_row_selected() -> No
                 "http_status": 502,
                 "latency_ms": 700,
                 "cost_usd": 0.0,
+                "input_tokens": 10,
+                "cached_input_tokens": 2,
+                "output_tokens": 0,
+                "total_tokens": 10,
                 "error_message": "timeout",
             },
             {
@@ -708,6 +743,10 @@ async def test_remote_dashboard_updates_details_when_recent_row_selected() -> No
                 "http_status": 200,
                 "latency_ms": 100,
                 "cost_usd": 0.5,
+                "input_tokens": 80,
+                "cached_input_tokens": 20,
+                "output_tokens": 15,
+                "total_tokens": 95,
                 "error_message": None,
             },
         ],
@@ -730,6 +769,7 @@ async def test_remote_dashboard_updates_details_when_recent_row_selected() -> No
 
         assert "Request: req-2" in rendered_details
         assert "Provider: provider-b" in rendered_details
+        assert "Tokens: in=80 cached=20 out=15 total=95" in rendered_details
         assert "Cost: $0.5000" in rendered_details
         assert details.has_class("state-good")
 

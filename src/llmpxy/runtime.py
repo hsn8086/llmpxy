@@ -122,6 +122,7 @@ class RuntimeManager:
                 requested_model=request.requested_model,
                 upstream_model=response.model,
                 input_tokens=response.usage.input_tokens,
+                cached_input_tokens=response.usage.cached_input_tokens,
                 output_tokens=response.usage.output_tokens,
                 total_tokens=response.usage.total_tokens,
                 cost_usd=cost.amount_usd,
@@ -144,6 +145,7 @@ class RuntimeManager:
                 status="success",
                 http_status=200,
                 input_tokens=response.usage.input_tokens,
+                cached_input_tokens=response.usage.cached_input_tokens,
                 output_tokens=response.usage.output_tokens,
                 total_tokens=response.usage.total_tokens,
                 cost_usd=cost.amount_usd,
@@ -269,6 +271,9 @@ class RuntimeManager:
         success_count = sum(1 for item in window_requests if item.status == "success")
         error_count = request_count - success_count
         total_cost_usd = sum(item.cost_usd for item in window_requests)
+        total_input_tokens = sum(item.input_tokens or 0 for item in window_requests)
+        total_cached_input_tokens = sum(item.cached_input_tokens or 0 for item in window_requests)
+        total_output_tokens = sum(item.output_tokens or 0 for item in window_requests)
         total_tokens = sum(item.total_tokens or 0 for item in window_requests)
         latency_values = [
             item.latency_ms for item in window_requests if item.latency_ms is not None
@@ -294,6 +299,9 @@ class RuntimeManager:
             "total_cost_usd": total_cost_usd,
             "avg_latency_ms": avg_latency_ms,
             "p95_latency_ms": p95_latency_ms,
+            "total_input_tokens": total_input_tokens,
+            "total_cached_input_tokens": total_cached_input_tokens,
+            "total_output_tokens": total_output_tokens,
             "total_tokens": total_tokens,
         }
 
@@ -311,6 +319,9 @@ class RuntimeManager:
         error_count = request_count - success_count
         avg_latency_ms = None
         latency_values = [item.latency_ms for item in requests if item.latency_ms is not None]
+        total_input_tokens = sum(item.input_tokens or 0 for item in requests)
+        total_cached_input_tokens = sum(item.cached_input_tokens or 0 for item in requests)
+        total_output_tokens = sum(item.output_tokens or 0 for item in requests)
         if latency_values:
             avg_latency_ms = int(sum(latency_values) / len(latency_values))
         error_rate = 0.0
@@ -324,6 +335,9 @@ class RuntimeManager:
             "error_rate": error_rate,
             "tps": request_count / seconds,
             "avg_latency_ms": avg_latency_ms,
+            "total_input_tokens": total_input_tokens,
+            "total_cached_input_tokens": total_cached_input_tokens,
+            "total_output_tokens": total_output_tokens,
             "total_cost_usd": sum(item.cost_usd for item in requests),
         }
 

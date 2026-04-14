@@ -184,6 +184,9 @@ class RemoteDashboardApp(App[None]):
             "Key",
             "Provider",
             "Model",
+            "In",
+            "Cached",
+            "Out",
             "Latency",
             "Cost",
             "Error",
@@ -413,6 +416,9 @@ class RemoteDashboardApp(App[None]):
                 str(item.get("api_key_name", "-")),
                 str(item.get("provider_name", "-")),
                 str(item.get("requested_model", "-")),
+                self._format_integer(item.get("input_tokens")),
+                self._format_integer(item.get("cached_input_tokens")),
+                self._format_integer(item.get("output_tokens")),
                 self._format_latency(item.get("latency_ms")),
                 f"{float(item.get('cost_usd', 0.0)):.4f}",
                 self._truncate(str(item.get("error_message") or item.get("error_code") or "-"), 40),
@@ -571,6 +577,7 @@ class RemoteDashboardApp(App[None]):
                 f"Success: recent={provider.get('recent_successes', 0)}  InFlight: {provider.get('in_flight', 0)}",
                 f"Window(60s): req={provider.get('window', {}).get('request_count', 0)} tps={self._format_float(provider.get('window', {}).get('tps'), 2)} err_rate={self._format_percent(provider.get('window', {}).get('error_rate'))}",
                 f"Window(60s): avg_latency={self._format_latency(provider.get('window', {}).get('avg_latency_ms'))} cost=${self._format_float(provider.get('window', {}).get('total_cost_usd'), 4)}",
+                f"Window(60s): in={self._format_integer(provider.get('window', {}).get('total_input_tokens'))} cached={self._format_integer(provider.get('window', {}).get('total_cached_input_tokens'))} out={self._format_integer(provider.get('window', {}).get('total_output_tokens'))}",
                 f"Last Success: {self._format_timestamp(provider.get('last_success_at'))}",
                 f"Last Error: {provider.get('last_error_message') or '-'}",
             ]
@@ -722,10 +729,17 @@ class RemoteDashboardApp(App[None]):
                 f"Status: {request.get('status', '-')} http={request.get('http_status', '-')}",
                 f"Key: {request.get('api_key_name', '-')}  Provider: {request.get('provider_name', '-')}",
                 f"Model: {request.get('requested_model', '-')}  Latency: {self._format_latency(request.get('latency_ms'))}",
+                f"Tokens: in={self._format_integer(request.get('input_tokens'))} cached={self._format_integer(request.get('cached_input_tokens'))} out={self._format_integer(request.get('output_tokens'))} total={self._format_integer(request.get('total_tokens'))}",
                 f"Cost: ${float(request.get('cost_usd', 0.0) or 0.0):.4f}",
                 f"Error: {request.get('error_message') or request.get('error_code') or '-'}",
             ]
         )
+
+    @staticmethod
+    def _format_integer(value: object | None) -> str:
+        if isinstance(value, int | float):
+            return str(int(value))
+        return "-"
 
     async def _stream_events(self) -> None:
         while True:

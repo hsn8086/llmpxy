@@ -92,6 +92,7 @@ class ApiKeyUsageRecord(BaseModel):
     requested_model: str
     upstream_model: str
     input_tokens: int = 0
+    cached_input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
     cost_usd: float = 0.0
@@ -122,6 +123,7 @@ class RequestEventRecord(BaseModel):
     error_code: str | None = None
     error_message: str | None = None
     input_tokens: int = 0
+    cached_input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
     cost_usd: float = 0.0

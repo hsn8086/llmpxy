@@ -80,6 +80,8 @@ class OpenAIChatAdapter:
             "messages": [_message_to_oaichat(message) for message in request.messages],
             "stream": request.stream,
         }
+        if request.stream:
+            payload["stream_options"] = {"include_usage": True}
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.top_p is not None:

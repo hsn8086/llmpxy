@@ -254,6 +254,10 @@ api_key_env = "UPSTREAM_A_KEY"
             upstream_model="gpt-4.1",
             status="success",
             http_status=200,
+            input_tokens=100,
+            cached_input_tokens=20,
+            output_tokens=50,
+            total_tokens=150,
             cost_usd=1.0,
         )
     )
@@ -272,6 +276,10 @@ api_key_env = "UPSTREAM_A_KEY"
             status="provider_error",
             http_status=502,
             error_message="timeout",
+            input_tokens=40,
+            cached_input_tokens=10,
+            output_tokens=0,
+            total_tokens=40,
             cost_usd=0.0,
         )
     )
@@ -289,6 +297,10 @@ api_key_env = "UPSTREAM_A_KEY"
             upstream_model="gpt-4.1",
             status="success",
             http_status=200,
+            input_tokens=30,
+            cached_input_tokens=5,
+            output_tokens=20,
+            total_tokens=50,
             cost_usd=5.0,
         )
     )
@@ -301,6 +313,7 @@ api_key_env = "UPSTREAM_A_KEY"
             requested_model="gpt-4.1",
             upstream_model="gpt-4.1",
             input_tokens=100,
+            cached_input_tokens=25,
             output_tokens=50,
             total_tokens=150,
             cost_usd=8.0,
@@ -327,12 +340,18 @@ api_key_env = "UPSTREAM_A_KEY"
         "total_cost_usd": 1.0,
         "avg_latency_ms": 1000,
         "p95_latency_ms": 500,
-        "total_tokens": 0,
+        "total_input_tokens": 140,
+        "total_cached_input_tokens": 30,
+        "total_output_tokens": 50,
+        "total_tokens": 190,
     }
     assert windows["10s"]["request_count"] == 1
     assert windows["60s"]["request_count"] == 2
     assert windows["5m"]["request_count"] == 3
     assert windows["5m"]["total_cost_usd"] == 6.0
+    assert windows["5m"]["total_input_tokens"] == 170
+    assert windows["5m"]["total_cached_input_tokens"] == 35
+    assert windows["5m"]["total_output_tokens"] == 70
     assert provider["window"] == {
         "seconds": 60,
         "request_count": 2,
@@ -341,6 +360,9 @@ api_key_env = "UPSTREAM_A_KEY"
         "error_rate": 0.5,
         "tps": 2 / 60,
         "avg_latency_ms": 1000,
+        "total_input_tokens": 140,
+        "total_cached_input_tokens": 30,
+        "total_output_tokens": 50,
         "total_cost_usd": 1.0,
     }
     assert alerts == [
