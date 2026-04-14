@@ -603,7 +603,7 @@ def _extract_tool_call_events(
             existing.type = raw_type
 
         if isinstance(function, dict):
-            if isinstance(function.get("name"), str):
+            if isinstance(function.get("name"), str) and function["name"]:
                 existing.name = function["name"]
             arguments_delta = function.get("arguments")
             if isinstance(arguments_delta, str) and arguments_delta:

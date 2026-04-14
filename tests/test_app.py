@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -13,6 +14,7 @@ from llmpxy.config import AppConfig
 from llmpxy.dispatcher import ProviderDispatcher
 from llmpxy.models import CanonicalResponse, CanonicalUsage
 from llmpxy.protocols.anthropic_messages import AnthropicAdapter
+from llmpxy.protocols.oai_chat import OpenAIChatAdapter
 from llmpxy.storage_sqlite import SQLiteConversationStore
 
 
@@ -2762,6 +2764,69 @@ def test_oaichat_serializes_empty_tool_message_content_as_empty_string() -> None
     payload = _message_to_oaichat(CanonicalMessage(role="tool"))
 
     assert payload == {"role": "tool", "content": ""}
+
+
+@pytest.mark.asyncio
+async def test_oaichat_parse_stream_preserves_tool_name_when_later_deltas_are_empty() -> None:
+    adapter = OpenAIChatAdapter()
+
+    async def lines() -> AsyncIterator[str]:
+        chunks = [
+            {
+                "id": "chatcmpl_1",
+                "model": "gpt-5.4",
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "todowrite", "arguments": '{"todos":['},
+                                }
+                            ]
+                        }
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl_1",
+                "model": "gpt-5.4",
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"name": "", "arguments": '{"content":"check"}'},
+                                }
+                            ]
+                        }
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl_1",
+                "model": "gpt-5.4",
+                "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+            },
+        ]
+        for chunk in chunks:
+            yield f"data: {json.dumps(chunk)}"
+        yield "data: [DONE]"
+
+    response, events = await adapter.parse_stream(lines(), "oairesp")
+
+    assert len(response.output_messages) == 1
+    tool_calls = response.output_messages[0].tool_calls
+    assert len(tool_calls) == 1
+    assert tool_calls[0].name == "todowrite"
+    assert tool_calls[0].arguments == '{"todos":[{"content":"check"}'
+    assert [event.event_type for event in events] == [
+        "function_call_arguments_delta",
+        "function_call_arguments_delta",
+    ]
 
 
 def test_oairesp_stream_previous_response_id_preserves_tool_call_history_for_oaichat(
