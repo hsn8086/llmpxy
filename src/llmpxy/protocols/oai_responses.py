@@ -844,6 +844,12 @@ def _normalize_input(value: Any) -> list[CanonicalMessage]:
             )
             continue
 
+        if item_type == "reasoning":
+            continue
+
+        if item_type is not None and item_type != "message":
+            continue
+
         role = (
             item.get("role")
             if item.get("role") in {"system", "developer", "user", "assistant", "tool"}
