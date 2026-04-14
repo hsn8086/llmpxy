@@ -2385,6 +2385,70 @@ def test_oairesp_accepts_single_content_object_in_input(
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
+def test_oairesp_accepts_null_message_content_in_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    captured_body: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_1",
+                "model": "a-model",
+                "choices": [{"message": {"role": "assistant", "content": "done"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-4.1": "a-model"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "null-message-content.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-4.1",
+            "input": [{"type": "message", "role": "assistant", "content": None}],
+        },
+    )
+
+    assert response.status_code == 200
+    messages = cast(list[dict[str, Any]], captured_body["messages"])
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["content"] == []
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
 def test_oairesp_accepts_function_call_items_in_input(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

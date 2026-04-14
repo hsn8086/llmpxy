@@ -811,6 +811,9 @@ def _normalize_input(value: Any) -> list[CanonicalMessage]:
             else "user"
         )
         content = item.get("content")
+        if content is None:
+            messages.append(CanonicalMessage(role=role, content=[]))
+            continue
         if isinstance(content, str):
             messages.append(
                 CanonicalMessage(
