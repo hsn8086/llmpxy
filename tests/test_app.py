@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, cast
@@ -10,6 +11,8 @@ from fastapi.testclient import TestClient
 from llmpxy.app import create_app
 from llmpxy.config import AppConfig
 from llmpxy.dispatcher import ProviderDispatcher
+from llmpxy.models import CanonicalResponse, CanonicalUsage
+from llmpxy.protocols.anthropic_messages import AnthropicAdapter
 from llmpxy.storage_sqlite import SQLiteConversationStore
 
 
@@ -274,6 +277,28 @@ def test_oairesp_stream(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     assert content_part_added["part"]["type"] == "output_text"
     assert events[-1]["response"]["object"] == "response"
     monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+def test_anthropic_stream_message_start_includes_usage() -> None:
+    adapter = AnthropicAdapter()
+    response = CanonicalResponse(
+        response_id="msg_1",
+        protocol_out="anthropic",
+        model="claude-sonnet-4-6",
+        created_at=1,
+        usage=CanonicalUsage(input_tokens=3, output_tokens=5, total_tokens=8),
+    )
+
+    async def collect() -> list[str]:
+        return [chunk async for chunk in adapter.format_stream(response, [])]
+
+    chunks = asyncio.run(collect())
+    assert chunks
+    first_chunk = chunks[0]
+    assert first_chunk.startswith("event: message_start\n")
+    payload = json.loads(first_chunk.split("data: ", 1)[1])
+    assert payload["type"] == "message_start"
+    assert payload["message"]["usage"] == {"input_tokens": 0, "output_tokens": 0}
 
 
 def test_oairesp_stream_exposes_function_call_events(
@@ -1567,6 +1592,268 @@ def test_oairesp_maps_minimal_reasoning_effort_to_low(
 
     assert response.status_code == 200
     assert captured_body["reasoning"] == {"effort": "low"}
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+def test_oairesp_to_oaichat_forwards_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    captured_body: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_1",
+                "model": "a-model",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "a-model"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "oairesp-to-oaichat-reasoning.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.4",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "reasoning": {"effort": "high"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured_body["reasoning_effort"] == "high"
+    assert "reasoning" not in captured_body
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+def test_oaichat_maps_minimal_reasoning_effort_to_low(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    captured_body: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_1",
+                "model": "a-model",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "a-model"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "oaichat-minimal-reasoning.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning": {"effort": "minimal"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured_body["reasoning_effort"] == "low"
+    assert "reasoning" not in captured_body
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+def test_oaichat_accepts_reasoning_effort_input_field(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    captured_body: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_1",
+                "model": "a-model",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "a-model"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "oaichat-reasoning-effort-input.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured_body["reasoning_effort"] == "high"
+    assert "reasoning" not in captured_body
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+def test_oaichat_preserves_reasoning_content_in_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_1",
+                "model": "a-model",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "ok",
+                            "reasoning_content": "internal reasoning summary",
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "a-model"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "oaichat-reasoning-content.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert (
+        response.json()["choices"][0]["message"]["reasoning_content"]
+        == "internal reasoning summary"
+    )
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 

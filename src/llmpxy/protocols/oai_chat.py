@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import HTTPException
+from loguru import logger
 
 from llmpxy.config import ProtocolName
 from llmpxy.models import (
@@ -59,6 +60,9 @@ class OpenAIChatAdapter:
             temperature=_optional_float(payload.get("temperature")),
             top_p=_optional_float(payload.get("top_p")),
             max_output_tokens=_optional_int(payload.get("max_tokens")),
+            reasoning=_normalize_reasoning(
+                payload.get("reasoning"), payload.get("reasoning_effort")
+            ),
             tools=_normalize_tools(payload.get("tools")),
             tool_choice=payload.get("tool_choice"),
             response_format=payload.get("response_format")
@@ -82,12 +86,22 @@ class OpenAIChatAdapter:
             payload["top_p"] = request.top_p
         if request.max_output_tokens is not None:
             payload["max_tokens"] = request.max_output_tokens
+        reasoning = _build_reasoning_payload(request.reasoning)
+        if reasoning is not None:
+            payload["reasoning_effort"] = reasoning["effort"]
         if request.tools is not None:
             payload["tools"] = request.tools
         if request.tool_choice is not None:
             payload["tool_choice"] = request.tool_choice
         if request.response_format is not None:
             payload["response_format"] = request.response_format
+        logger.bind(request_id="-", provider="-", round=0, attempt=0).debug(
+            "oaichat build_request mapped_model={} message_count={} reasoning={} max_tokens={}",
+            mapped_model,
+            len(payload["messages"]),
+            payload.get("reasoning_effort"),
+            payload.get("max_tokens"),
+        )
         return "/chat/completions", payload
 
     def parse_response(self, payload: dict[str, Any], protocol_out: str) -> CanonicalResponse:
@@ -95,6 +109,11 @@ class OpenAIChatAdapter:
         message = choice.get("message", {})
         content = _normalize_content(message.get("content"))
         tool_calls = _normalize_tool_calls(message.get("tool_calls"))
+        reasoning_content = (
+            message.get("reasoning_content")
+            if isinstance(message.get("reasoning_content"), str)
+            else None
+        )
         response_id = (
             payload["id"] if isinstance(payload.get("id"), str) else f"chatcmpl_{uuid.uuid4().hex}"
         )
@@ -106,7 +125,12 @@ class OpenAIChatAdapter:
             model=model,
             created_at=int(payload.get("created", int(time.time()))),
             output_messages=[
-                CanonicalMessage(role="assistant", content=content, tool_calls=tool_calls)
+                CanonicalMessage(
+                    role="assistant",
+                    content=content,
+                    tool_calls=tool_calls,
+                    reasoning_content=reasoning_content,
+                )
             ],
             usage=CanonicalUsage(
                 input_tokens=int(payload.get("usage", {}).get("prompt_tokens", 0)),
@@ -380,6 +404,25 @@ def _normalize_protocol(value: str, default: ProtocolName) -> ProtocolName:
     return default
 
 
+def _normalize_reasoning(value: Any, effort_value: Any = None) -> dict[str, Any] | None:
+    reasoning: dict[str, Any] = {}
+    if isinstance(value, dict) and isinstance(value.get("effort"), str):
+        reasoning["effort"] = value["effort"]
+    elif isinstance(effort_value, str):
+        reasoning["effort"] = effort_value
+    return reasoning or None
+
+
+def _build_reasoning_payload(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not value:
+        return None
+    reasoning = dict(value)
+    effort = reasoning.get("effort")
+    if effort == "minimal":
+        reasoning["effort"] = "low"
+    return reasoning or None
+
+
 def _normalize_content(content: Any) -> list[CanonicalContentPart]:
     if content is None:
         return []
@@ -454,6 +497,8 @@ def _message_to_oaichat(message: CanonicalMessage) -> dict[str, Any]:
         ]
     if message.tool_call_id is not None:
         payload["tool_call_id"] = message.tool_call_id
+    if message.reasoning_content is not None:
+        payload["reasoning_content"] = message.reasoning_content
     return payload
 
 

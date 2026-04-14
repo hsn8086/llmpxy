@@ -25,6 +25,7 @@ class CanonicalMessage(BaseModel):
     content: list[CanonicalContentPart] = Field(default_factory=list)
     tool_calls: list[CanonicalToolCall] = Field(default_factory=list)
     tool_call_id: str | None = None
+    reasoning_content: str | None = None
 
 
 class CanonicalUsage(BaseModel):
