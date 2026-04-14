@@ -1,0 +1,79 @@
+[server]
+host = "127.0.0.1"
+port = 18086
+
+[admin]
+enabled = true
+token = "12345"
+
+[route]
+type = "provider"
+name = "tokenflux"
+
+[network]
+proxy = "http://192.168.64.3:7893"
+trust_env = false
+connect_timeout_seconds = 30.0
+read_timeout_seconds = 120.0
+write_timeout_seconds = 120.0
+pool_timeout_seconds = 30.0
+
+[proxy]
+strip_unsupported_fields = true
+log_level = "info"
+
+[retry]
+provider_error_threshold = 3
+base_backoff_seconds = 1.0
+max_backoff_seconds = 1.0
+max_rounds = 5
+
+[logging]
+dir = "./logs"
+info_file = "info.log"
+debug_file = "debug.log"
+rotation = "100 MB"
+retention = "10 days"
+
+[storage]
+backend = "sqlite"
+sqlite_path = "./data/llmpxy.db"
+file_dir = "./data/conversations"
+ttl_seconds = 604800
+
+[[providers]]
+name = "pneko"
+protocol = "oaichat"
+base_url = "https://bridge.pulseneko.com/v1"
+api_key_env = "PNEKO_API_KEY"
+timeout_seconds = 30
+
+[providers.pricing.default]
+input_per_million_tokens_usd = 2.50
+cached_input_per_million_tokens_usd = 0.25
+output_per_million_tokens_usd = 15.00
+
+[[providers]]
+name = "tokenflux"
+protocol = "oaichat"
+base_url = "https://tokenflux.dev/v1"
+api_key_env = "TOKENFLUX_API_KEY"
+timeout_seconds = 120.0
+
+[providers.pricing.default]
+input_per_million_tokens_usd = 2.50
+cached_input_per_million_tokens_usd = 0.25
+output_per_million_tokens_usd = 15.00
+
+[[provider_groups]]
+name = "default"
+strategy = "load_balance"
+members = ["pneko", "tokenflux"]
+model_whitelist_only = true
+models = ["gpt-5.4", "gpt-5.4-nano"]
+
+[[api_keys]]
+uuid = "58d609a9-3b52-4bb1-8369-8fe81c3fe72c"
+name = "client-a"
+key = "wG0MCUnJqMkumPFc5caHafTzT2W5Kt8LSWggI8nDHUM"
+limit_usd = 100.0

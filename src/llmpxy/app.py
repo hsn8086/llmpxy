@@ -24,7 +24,7 @@ from llmpxy.models import (
     StoredConversation,
 )
 from llmpxy.protocols.registry import get_adapter
-from llmpxy.proxy_client import ProviderError
+from llmpxy.proxy_client import ProviderError, create_async_client, stream_lines
 from llmpxy.storage import ConversationStore
 
 
@@ -184,6 +184,7 @@ async def _handle_protocol_request(
     inbound_protocol: ProtocolName,
 ) -> Response:
     request_id = str(uuid.uuid4())
+    started_perf = time.perf_counter()
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
@@ -217,6 +218,25 @@ async def _handle_protocol_request(
 
     try:
         if canonical_request.stream:
+            route_providers = dispatcher.resolve_route_provider_order()
+            if _can_passthrough_live_stream(inbound_protocol, route_providers):
+                provider = route_providers[0]
+                return StreamingResponse(
+                    _live_stream_passthrough(
+                        inbound_protocol=inbound_protocol,
+                        request_id=request_id,
+                        canonical_request=canonical_request,
+                        provider=provider,
+                        adapter=adapter,
+                        runtime=None,
+                        api_key=None,
+                        store=store,
+                        config=config,
+                        started_perf=started_perf,
+                    ),
+                    media_type=_stream_media_type(inbound_protocol),
+                    headers=_stream_headers(),
+                )
             response, events, provider = await dispatcher.dispatch_stream(
                 canonical_request, request_id=request_id
             )
@@ -238,6 +258,7 @@ async def _handle_protocol_request(
             return StreamingResponse(
                 adapter.format_stream(response, events),
                 media_type=_stream_media_type(inbound_protocol),
+                headers=_stream_headers(),
             )
 
         response, provider = await dispatcher.dispatch(canonical_request, request_id=request_id)
@@ -330,6 +351,24 @@ async def _handle_protocol_request_with_api_key(
 
     try:
         if canonical_request.stream:
+            if _can_passthrough_live_stream(inbound_protocol, selectable_providers):
+                provider = selectable_providers[0]
+                return StreamingResponse(
+                    _live_stream_passthrough(
+                        inbound_protocol=inbound_protocol,
+                        request_id=request_id,
+                        canonical_request=canonical_request,
+                        provider=provider,
+                        adapter=adapter,
+                        runtime=runtime,
+                        api_key=api_key,
+                        store=store,
+                        config=config,
+                        started_perf=started_perf,
+                    ),
+                    media_type=_stream_media_type(inbound_protocol),
+                    headers=_stream_headers(),
+                )
             response, events, provider = await dispatcher.dispatch_stream(
                 canonical_request,
                 request_id=request_id,
@@ -364,6 +403,7 @@ async def _handle_protocol_request_with_api_key(
             return StreamingResponse(
                 adapter.format_stream(response, events),
                 media_type=_stream_media_type(inbound_protocol),
+                headers=_stream_headers(),
             )
 
         response, provider = await dispatcher.dispatch(
@@ -510,3 +550,76 @@ def _stream_media_type(inbound_protocol: ProtocolName) -> str:
     if inbound_protocol in {"oairesp", "oaichat", "anthropic"}:
         return "text/event-stream"
     return "application/json"
+
+
+def _stream_headers() -> dict[str, str]:
+    return {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    }
+
+
+def _can_passthrough_live_stream(
+    inbound_protocol: ProtocolName, providers: list[ProviderConfig]
+) -> bool:
+    if inbound_protocol != "oaichat":
+        return False
+    if len(providers) != 1:
+        return False
+    return providers[0].protocol == "oaichat"
+
+
+async def _live_stream_passthrough(
+    *,
+    inbound_protocol: ProtocolName,
+    request_id: str,
+    canonical_request: Any,
+    provider: ProviderConfig,
+    adapter: Any,
+    runtime: RuntimeManager | None,
+    api_key: AuthenticatedApiKey | None,
+    store: ConversationStore,
+    config: AppConfig,
+    started_perf: float,
+) -> AsyncIterator[str]:
+    outbound_adapter = get_adapter(provider.protocol)
+    mapped_model = provider.map_model(canonical_request.requested_model)
+    path, payload = outbound_adapter.build_request(canonical_request, mapped_model)
+    buffered_lines: list[str] = []
+    async with create_async_client(config, provider) as client:
+        async for line in stream_lines(client, provider, path, payload):
+            buffered_lines.append(line)
+            yield f"{line}\n\n"
+
+    async def replay_lines() -> AsyncIterator[str]:
+        for line in buffered_lines:
+            yield line
+
+    response, _events = await outbound_adapter.parse_stream(replay_lines(), provider.protocol)
+    if runtime is not None and api_key is not None:
+        runtime.record_usage(
+            api_key=api_key,
+            request_id=request_id,
+            request=canonical_request,
+            response=response,
+            provider_name=provider.name,
+            latency_ms=int((time.perf_counter() - started_perf) * 1000),
+        )
+        await runtime.publish_request_event(
+            {
+                "request_id": request_id,
+                "api_key": api_key.name,
+                "provider": provider.name,
+                "model": canonical_request.requested_model,
+                "status": "success",
+            }
+        )
+    if inbound_protocol == "oairesp":
+        _save_conversation(
+            store,
+            adapter.format_response(response),
+            response.model,
+            response.output_messages,
+            canonical_request.metadata,
+            config.storage.ttl_seconds,
+        )

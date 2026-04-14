@@ -9,7 +9,7 @@ from typing import Any, cast
 import pytest
 from fastapi.testclient import TestClient
 
-from llmpxy.app import create_app
+from llmpxy.app import _live_stream_passthrough, create_app
 from llmpxy.config import AppConfig
 from llmpxy.dispatcher import ProviderDispatcher
 from llmpxy.models import CanonicalResponse, CanonicalUsage
@@ -2543,6 +2543,103 @@ def test_oairesp_merges_function_call_item_into_following_assistant_message(
         "tool_call_id": "call_1",
         "content": "README.md",
     }
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+@pytest.mark.asyncio
+async def test_oaichat_stream_passthrough_emits_first_chunk_before_upstream_finishes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import threading
+    import httpx
+
+    second_chunk_released = threading.Event()
+
+    async def stream_success() -> AsyncIterator[bytes]:
+        first = json.dumps(
+            {
+                "id": "chat1",
+                "model": "a-model",
+                "choices": [{"delta": {"content": "hel"}}],
+            }
+        )
+        yield f"data: {first}\n\n".encode()
+        await asyncio.sleep(0.15)
+        second = json.dumps(
+            {
+                "id": "chat1",
+                "model": "a-model",
+                "choices": [{"delta": {"content": "lo"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            }
+        )
+        yield f"data: {second}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+        second_chunk_released.set()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=stream_success(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-4.1": "a-model"},
+                }
+            ],
+        }
+    )
+    adapter = OpenAIChatAdapter()
+    canonical_request = adapter.parse_request(
+        {
+            "model": "gpt-4.1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+        strip_unsupported_fields=True,
+    )
+    generator = _live_stream_passthrough(
+        inbound_protocol="oaichat",
+        request_id="req-live",
+        canonical_request=canonical_request,
+        provider=config.providers[0],
+        adapter=adapter,
+        runtime=None,
+        api_key=None,
+        store=SQLiteConversationStore(tmp_path / "live-stream.db"),
+        config=config,
+        started_perf=0.0,
+    )
+
+    first_chunk = await anext(generator)
+    assert '"content": "hel"' in first_chunk
+    assert not second_chunk_released.is_set()
+
+    remaining_chunks: list[str] = []
+    async for chunk in generator:
+        remaining_chunks.append(chunk)
+
+    assert second_chunk_released.is_set()
+    assert any('"content": "lo"' in chunk for chunk in remaining_chunks)
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
