@@ -49,12 +49,18 @@ class ApiKeyConfig(BaseModel):
 
 class PricingConfig(BaseModel):
     input_per_million_tokens_usd: float
+    cached_input_per_million_tokens_usd: float | None = None
     output_per_million_tokens_usd: float
 
     @model_validator(mode="after")
     def validate_pricing(self) -> "PricingConfig":
         if self.input_per_million_tokens_usd < 0:
             raise ValueError("pricing.input_per_million_tokens_usd must be >= 0")
+        if (
+            self.cached_input_per_million_tokens_usd is not None
+            and self.cached_input_per_million_tokens_usd < 0
+        ):
+            raise ValueError("pricing.cached_input_per_million_tokens_usd must be >= 0")
         if self.output_per_million_tokens_usd < 0:
             raise ValueError("pricing.output_per_million_tokens_usd must be >= 0")
         return self

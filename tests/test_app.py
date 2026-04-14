@@ -2829,6 +2829,50 @@ async def test_oaichat_parse_stream_preserves_tool_name_when_later_deltas_are_em
     ]
 
 
+def test_oaichat_parse_response_reads_cached_prompt_tokens() -> None:
+    adapter = OpenAIChatAdapter()
+
+    response = adapter.parse_response(
+        {
+            "id": "chatcmpl_1",
+            "model": "a-model",
+            "choices": [{"message": {"role": "assistant", "content": "hello"}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "prompt_tokens_details": {"cached_tokens": 40},
+                "completion_tokens": 25,
+                "total_tokens": 125,
+            },
+        },
+        "oaichat",
+    )
+
+    assert response.usage.input_tokens == 100
+    assert response.usage.cached_input_tokens == 40
+    assert response.usage.output_tokens == 25
+
+
+@pytest.mark.asyncio
+async def test_oairesp_parse_stream_reads_cached_input_tokens() -> None:
+    from llmpxy.protocols.oai_responses import OpenAIResponsesAdapter
+
+    adapter = OpenAIResponsesAdapter()
+
+    async def lines() -> AsyncIterator[str]:
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_1","model":"a-model",'
+            '"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":40},'
+            '"output_tokens":25,"total_tokens":125}}}\n\n'
+        )
+        yield "data: [DONE]"
+
+    response, _events = await adapter.parse_stream(lines(), "oairesp")
+
+    assert response.usage.input_tokens == 100
+    assert response.usage.cached_input_tokens == 40
+    assert response.usage.output_tokens == 25
+
+
 def test_oairesp_stream_previous_response_id_preserves_tool_call_history_for_oaichat(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

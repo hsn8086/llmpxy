@@ -144,6 +144,9 @@ class OpenAIResponsesAdapter:
                 output_messages=messages,
                 usage=CanonicalUsage(
                     input_tokens=int(usage_payload.get("input_tokens", 0)),
+                    cached_input_tokens=int(
+                        usage_payload.get("input_tokens_details", {}).get("cached_tokens", 0)
+                    ),
                     output_tokens=int(usage_payload.get("output_tokens", 0)),
                     total_tokens=int(usage_payload.get("total_tokens", 0)),
                 ),
@@ -260,6 +263,11 @@ class OpenAIResponsesAdapter:
                     usage = CanonicalUsage(
                         input_tokens=int(
                             completed["usage"].get("input_tokens", usage.input_tokens)
+                        ),
+                        cached_input_tokens=int(
+                            completed["usage"]
+                            .get("input_tokens_details", {})
+                            .get("cached_tokens", usage.cached_input_tokens)
                         ),
                         output_tokens=int(
                             completed["usage"].get("output_tokens", usage.output_tokens)

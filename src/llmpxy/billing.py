@@ -22,11 +22,22 @@ def calculate_usage_cost(
     if pricing is None:
         return UsageCost(amount_usd=0.0, pricing_source=None)
 
-    input_cost = usage.input_tokens / 1_000_000 * pricing.input_per_million_tokens_usd
+    cached_input_tokens = min(max(usage.cached_input_tokens, 0), max(usage.input_tokens, 0))
+    uncached_input_tokens = max(usage.input_tokens - cached_input_tokens, 0)
+    cached_input_price = (
+        pricing.cached_input_per_million_tokens_usd
+        if pricing.cached_input_per_million_tokens_usd is not None
+        else pricing.input_per_million_tokens_usd
+    )
+    input_cost = uncached_input_tokens / 1_000_000 * pricing.input_per_million_tokens_usd
+    cached_input_cost = cached_input_tokens / 1_000_000 * cached_input_price
     output_cost = usage.output_tokens / 1_000_000 * pricing.output_per_million_tokens_usd
     pricing_source = (
         requested_model if requested_model in provider.pricing.models else upstream_model
     )
     if pricing_source not in provider.pricing.models:
         pricing_source = "default"
-    return UsageCost(amount_usd=input_cost + output_cost, pricing_source=pricing_source)
+    return UsageCost(
+        amount_usd=input_cost + cached_input_cost + output_cost,
+        pricing_source=pricing_source,
+    )

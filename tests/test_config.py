@@ -213,11 +213,13 @@ def test_provider_pricing_supports_default_and_model_override() -> None:
                     "pricing": {
                         "default": {
                             "input_per_million_tokens_usd": 1.0,
+                            "cached_input_per_million_tokens_usd": 0.1,
                             "output_per_million_tokens_usd": 2.0,
                         },
                         "models": {
                             "gpt-4.1": {
                                 "input_per_million_tokens_usd": 3.0,
+                                "cached_input_per_million_tokens_usd": 0.3,
                                 "output_per_million_tokens_usd": 4.0,
                             }
                         },
@@ -230,6 +232,32 @@ def test_provider_pricing_supports_default_and_model_override() -> None:
     provider = config.providers[0]
     assert provider.resolve_pricing("gpt-4.1", "mapped-model") is not None
     assert provider.resolve_pricing("missing", "mapped-model") == provider.pricing.default
+    assert provider.pricing.default is not None
+    assert provider.pricing.default.cached_input_per_million_tokens_usd == 0.1
+
+
+def test_provider_pricing_rejects_negative_cached_input_price() -> None:
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(
+            {
+                "route": {"type": "provider", "name": "openai-a"},
+                "providers": [
+                    {
+                        "name": "openai-a",
+                        "protocol": "oaichat",
+                        "base_url": "https://a.example/v1",
+                        "api_key_env": "A_KEY",
+                        "pricing": {
+                            "default": {
+                                "input_per_million_tokens_usd": 1.0,
+                                "cached_input_per_million_tokens_usd": -0.1,
+                                "output_per_million_tokens_usd": 2.0,
+                            }
+                        },
+                    }
+                ],
+            }
+        )
 
 
 def test_api_key_uuid_must_be_unique() -> None:
