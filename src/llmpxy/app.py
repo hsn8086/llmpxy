@@ -309,6 +309,7 @@ async def _handle_protocol_request_with_api_key(
 ) -> Response:
     request_id = str(uuid.uuid4())
     started_at = int(time.time())
+    started_perf = time.perf_counter()
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
@@ -349,6 +350,7 @@ async def _handle_protocol_request_with_api_key(
                 request=canonical_request,
                 response=response,
                 provider_name=provider.name,
+                latency_ms=int((time.perf_counter() - started_perf) * 1000),
             )
             await runtime.publish_request_event(
                 {
@@ -375,6 +377,7 @@ async def _handle_protocol_request_with_api_key(
             request=canonical_request,
             response=response,
             provider_name=provider.name,
+            latency_ms=int((time.perf_counter() - started_perf) * 1000),
         )
         await runtime.publish_request_event(
             {
@@ -387,12 +390,13 @@ async def _handle_protocol_request_with_api_key(
             }
         )
     except ProviderError as exc:
+        latency_ms = int((time.perf_counter() - started_perf) * 1000)
         runtime.current().store.put_request_event(
             RequestEventRecord(
                 request_id=request_id,
                 started_at=started_at,
                 finished_at=int(time.time()),
-                latency_ms=(int(time.time()) - started_at) * 1000,
+                latency_ms=latency_ms,
                 protocol_in=inbound_protocol,
                 stream=canonical_request.stream,
                 api_key_uuid=api_key.uuid,
@@ -419,12 +423,13 @@ async def _handle_protocol_request_with_api_key(
         )
         raise HTTPException(status_code=exc.status_code or 502, detail=str(exc)) from exc
     except AllProvidersFailedError as exc:
+        latency_ms = int((time.perf_counter() - started_perf) * 1000)
         runtime.current().store.put_request_event(
             RequestEventRecord(
                 request_id=request_id,
                 started_at=started_at,
                 finished_at=int(time.time()),
-                latency_ms=(int(time.time()) - started_at) * 1000,
+                latency_ms=latency_ms,
                 protocol_in=inbound_protocol,
                 stream=canonical_request.stream,
                 api_key_uuid=api_key.uuid,

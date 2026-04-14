@@ -7,7 +7,15 @@ from typing import cast
 import pytest
 from fastapi import HTTPException
 
+from llmpxy.auth import AuthenticatedApiKey
 from llmpxy.models import ApiKeyUsageRecord, RequestEventRecord
+from llmpxy.models import (
+    CanonicalContentPart,
+    CanonicalMessage,
+    CanonicalRequest,
+    CanonicalResponse,
+    CanonicalUsage,
+)
 from llmpxy.runtime import RuntimeManager
 
 
@@ -377,3 +385,72 @@ api_key_env = "UPSTREAM_A_KEY"
             "message": "Budget usage 80%",
         }
     ]
+
+
+def test_runtime_record_usage_preserves_millisecond_latency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UPSTREAM_A_KEY", "upstream-a")
+
+    config_file = tmp_path / "config.toml"
+    _write_config(
+        config_file,
+        """
+[route]
+type = "provider"
+name = "provider-a"
+
+[[api_keys]]
+uuid = "11111111-1111-1111-1111-111111111111"
+name = "client-a"
+key = "client-a"
+
+[[providers]]
+name = "provider-a"
+protocol = "oaichat"
+base_url = "https://a.example/v1"
+api_key_env = "UPSTREAM_A_KEY"
+""",
+    )
+
+    runtime = RuntimeManager(config_file)
+    api_key = AuthenticatedApiKey(
+        uuid="11111111-1111-1111-1111-111111111111",
+        name="client-a",
+        key="client-a",
+        limit_usd=None,
+        provider_limits_usd={},
+        group_limits_usd={},
+    )
+    runtime.record_usage(
+        api_key=api_key,
+        request_id="req-latency",
+        request=CanonicalRequest(
+            protocol_in="oaichat",
+            requested_model="gpt-4.1",
+            messages=[
+                CanonicalMessage(
+                    role="user",
+                    content=[CanonicalContentPart(type="text", text="hi")],
+                )
+            ],
+        ),
+        response=CanonicalResponse(
+            protocol_out="oaichat",
+            response_id="resp-latency",
+            created_at=int(time.time()),
+            model="gpt-4.1",
+            output_messages=[
+                CanonicalMessage(
+                    role="assistant",
+                    content=[CanonicalContentPart(type="text", text="hello")],
+                )
+            ],
+            usage=CanonicalUsage(input_tokens=10, output_tokens=5, total_tokens=15),
+        ),
+        provider_name="provider-a",
+        latency_ms=123,
+    )
+
+    event = runtime.current().store.list_recent_request_events(1)[0]
+    assert event.latency_ms == 123

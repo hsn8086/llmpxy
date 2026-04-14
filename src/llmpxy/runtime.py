@@ -105,6 +105,7 @@ class RuntimeManager:
         request: CanonicalRequest,
         response: CanonicalResponse,
         provider_name: str,
+        latency_ms: int,
     ) -> UsageCost:
         state = self.current()
         cost = calculate_usage_cost(
@@ -134,7 +135,7 @@ class RuntimeManager:
                 request_id=request_id,
                 started_at=response.created_at,
                 finished_at=int(time.time()),
-                latency_ms=max(int(time.time()) - response.created_at, 0) * 1000,
+                latency_ms=max(latency_ms, 0),
                 protocol_in=request.protocol_in,
                 stream=request.stream,
                 api_key_uuid=api_key.uuid,
