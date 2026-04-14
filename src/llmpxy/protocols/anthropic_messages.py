@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 import time
 import uuid
@@ -122,52 +123,10 @@ class AnthropicAdapter:
         lines: AsyncIterator[str],
         protocol_out: str,
     ) -> tuple[CanonicalResponse, list[CanonicalStreamEvent]]:
-        response_id = f"msg_{uuid.uuid4().hex}"
-        text_parts: list[str] = []
-        model = ""
-        usage = CanonicalUsage()
-        events: list[CanonicalStreamEvent] = []
-        for line in [item async for item in lines]:
-            if not line.startswith("data: "):
-                continue
-            payload = json.loads(line[6:])
-            if payload.get("type") == "message_start":
-                message = payload.get("message")
-                if isinstance(message, dict) and isinstance(message.get("model"), str):
-                    model = message["model"]
-            elif payload.get("type") == "content_block_delta":
-                delta = payload.get("delta")
-                if isinstance(delta, dict) and isinstance(delta.get("text"), str):
-                    text_parts.append(delta["text"])
-                    events.append(
-                        CanonicalStreamEvent(
-                            event_type="text_delta", response_id=response_id, delta=delta["text"]
-                        )
-                    )
-            elif payload.get("type") == "message_delta":
-                usage_payload = payload.get("usage")
-                if isinstance(usage_payload, dict):
-                    usage = CanonicalUsage(
-                        input_tokens=int(usage_payload.get("input_tokens", usage.input_tokens)),
-                        output_tokens=int(usage_payload.get("output_tokens", usage.output_tokens)),
-                        total_tokens=int(usage_payload.get("input_tokens", usage.input_tokens))
-                        + int(usage_payload.get("output_tokens", usage.output_tokens)),
-                    )
-
-        response = CanonicalResponse(
-            response_id=response_id,
-            protocol_out=_normalize_protocol(protocol_out, "anthropic"),
-            model=model,
-            created_at=int(time.time()),
-            output_messages=[
-                CanonicalMessage(
-                    role="assistant",
-                    content=[CanonicalContentPart(type="text", text="".join(text_parts))],
-                )
-            ],
-            usage=usage,
-        )
-        return response, events
+        state = init_anthropic_stream_state(protocol_out)
+        async for line in lines:
+            process_anthropic_stream_line(state, line)
+        return build_anthropic_stream_result(state)
 
     def format_response(self, response: CanonicalResponse) -> dict[str, Any]:
         message = (
@@ -252,6 +211,71 @@ def _normalize_protocol(value: str, default: ProtocolName) -> ProtocolName:
     if value == "anthropic":
         return "anthropic"
     return default
+
+
+@dataclass
+class AnthropicStreamState:
+    protocol_out: str
+    response_id: str = field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
+    text_parts: list[str] = field(default_factory=list)
+    model: str = ""
+    usage: CanonicalUsage = field(default_factory=CanonicalUsage)
+    events: list[CanonicalStreamEvent] = field(default_factory=list)
+
+
+def init_anthropic_stream_state(protocol_out: str) -> AnthropicStreamState:
+    return AnthropicStreamState(protocol_out=protocol_out)
+
+
+def process_anthropic_stream_line(
+    state: AnthropicStreamState, line: str
+) -> list[CanonicalStreamEvent]:
+    if not line.startswith("data: "):
+        return []
+    payload = json.loads(line[6:])
+    emitted: list[CanonicalStreamEvent] = []
+    if payload.get("type") == "message_start":
+        message = payload.get("message")
+        if isinstance(message, dict) and isinstance(message.get("model"), str):
+            state.model = message["model"]
+    elif payload.get("type") == "content_block_delta":
+        delta = payload.get("delta")
+        if isinstance(delta, dict) and isinstance(delta.get("text"), str):
+            state.text_parts.append(delta["text"])
+            event = CanonicalStreamEvent(
+                event_type="text_delta", response_id=state.response_id, delta=delta["text"]
+            )
+            state.events.append(event)
+            emitted.append(event)
+    elif payload.get("type") == "message_delta":
+        usage_payload = payload.get("usage")
+        if isinstance(usage_payload, dict):
+            state.usage = CanonicalUsage(
+                input_tokens=int(usage_payload.get("input_tokens", state.usage.input_tokens)),
+                output_tokens=int(usage_payload.get("output_tokens", state.usage.output_tokens)),
+                total_tokens=int(usage_payload.get("input_tokens", state.usage.input_tokens))
+                + int(usage_payload.get("output_tokens", state.usage.output_tokens)),
+            )
+    return emitted
+
+
+def build_anthropic_stream_result(
+    state: AnthropicStreamState,
+) -> tuple[CanonicalResponse, list[CanonicalStreamEvent]]:
+    response = CanonicalResponse(
+        response_id=state.response_id,
+        protocol_out=_normalize_protocol(state.protocol_out, "anthropic"),
+        model=state.model,
+        created_at=int(time.time()),
+        output_messages=[
+            CanonicalMessage(
+                role="assistant",
+                content=[CanonicalContentPart(type="text", text="".join(state.text_parts))],
+            )
+        ],
+        usage=state.usage,
+    )
+    return response, state.events
 
 
 def _normalize_anthropic_content(content: Any) -> list[CanonicalContentPart]:

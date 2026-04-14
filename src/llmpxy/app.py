@@ -31,6 +31,11 @@ from llmpxy.protocols.oai_chat import (
     init_chat_stream_state,
     process_chat_stream_line,
 )
+from llmpxy.protocols.anthropic_messages import (
+    build_anthropic_stream_result,
+    init_anthropic_stream_state,
+    process_anthropic_stream_line,
+)
 from llmpxy.protocols.oai_responses import (
     finalize_response_stream,
     init_response_stream_formatter_state,
@@ -231,13 +236,12 @@ async def _handle_protocol_request(
         if canonical_request.stream:
             route_providers = dispatcher.resolve_route_provider_order()
             if _can_bridge_live_stream(inbound_protocol, route_providers):
-                provider = route_providers[0]
                 return StreamingResponse(
                     await _prepare_live_stream_bridge(
                         inbound_protocol=inbound_protocol,
                         request_id=request_id,
                         canonical_request=canonical_request,
-                        provider=provider,
+                        providers=route_providers,
                         adapter=adapter,
                         runtime=None,
                         api_key=None,
@@ -249,13 +253,12 @@ async def _handle_protocol_request(
                     headers=_stream_headers(),
                 )
             if _can_passthrough_live_stream(inbound_protocol, route_providers):
-                provider = route_providers[0]
                 return StreamingResponse(
                     await _prepare_live_stream_passthrough(
                         inbound_protocol=inbound_protocol,
                         request_id=request_id,
                         canonical_request=canonical_request,
-                        provider=provider,
+                        providers=route_providers,
                         adapter=adapter,
                         runtime=None,
                         api_key=None,
@@ -381,13 +384,12 @@ async def _handle_protocol_request_with_api_key(
     try:
         if canonical_request.stream:
             if _can_bridge_live_stream(inbound_protocol, selectable_providers):
-                provider = selectable_providers[0]
                 return StreamingResponse(
                     await _prepare_live_stream_bridge(
                         inbound_protocol=inbound_protocol,
                         request_id=request_id,
                         canonical_request=canonical_request,
-                        provider=provider,
+                        providers=selectable_providers,
                         adapter=adapter,
                         runtime=runtime,
                         api_key=api_key,
@@ -399,13 +401,12 @@ async def _handle_protocol_request_with_api_key(
                     headers=_stream_headers(),
                 )
             if _can_passthrough_live_stream(inbound_protocol, selectable_providers):
-                provider = selectable_providers[0]
                 return StreamingResponse(
                     await _prepare_live_stream_passthrough(
                         inbound_protocol=inbound_protocol,
                         request_id=request_id,
                         canonical_request=canonical_request,
-                        provider=provider,
+                        providers=selectable_providers,
                         adapter=adapter,
                         runtime=runtime,
                         api_key=api_key,
@@ -611,17 +612,21 @@ def _can_passthrough_live_stream(
 ) -> bool:
     if inbound_protocol not in {"oaichat", "anthropic"}:
         return False
-    if len(providers) != 1:
+    if not providers:
         return False
-    return providers[0].protocol == inbound_protocol
+    return all(provider.protocol == inbound_protocol for provider in providers)
 
 
 def _can_bridge_live_stream(
     inbound_protocol: ProtocolName, providers: list[ProviderConfig]
 ) -> bool:
-    if len(providers) != 1:
+    if not providers:
         return False
-    return inbound_protocol == "oairesp" and providers[0].protocol == "oaichat"
+    return (
+        inbound_protocol == "oairesp"
+        and all(provider.protocol == providers[0].protocol for provider in providers)
+        and providers[0].protocol in {"oaichat", "anthropic"}
+    )
 
 
 async def _live_stream_passthrough(
@@ -694,7 +699,7 @@ async def _prepare_live_stream_passthrough(
     inbound_protocol: ProtocolName,
     request_id: str,
     canonical_request: Any,
-    provider: ProviderConfig,
+    providers: list[ProviderConfig],
     adapter: Any,
     runtime: RuntimeManager | None,
     api_key: AuthenticatedApiKey | None,
@@ -702,47 +707,56 @@ async def _prepare_live_stream_passthrough(
     config: AppConfig,
     started_perf: float,
 ) -> AsyncIterator[str]:
-    outbound_adapter = get_adapter(provider.protocol)
-    mapped_model = provider.map_model(canonical_request.requested_model)
-    path, payload = outbound_adapter.build_request(canonical_request, mapped_model)
-    client = create_async_client(config, provider)
-    try:
-        response = await open_stream(client, provider, path, payload)
-        line_iterator = response.aiter_lines()
-        first_line = ""
-        async for line in line_iterator:
-            if not line:
-                continue
-            first_line = line
-            break
-        if not first_line:
-            await response.aclose()
-            await client.aclose()
-            raise ProviderError(
-                f"Provider {provider.name} returned an empty stream",
-                retryable=False,
-                base_url=provider.base_url,
-                path=path,
+    last_error: ProviderError | None = None
+    for provider in providers:
+        outbound_adapter = get_adapter(provider.protocol)
+        mapped_model = provider.map_model(canonical_request.requested_model)
+        path, payload = outbound_adapter.build_request(canonical_request, mapped_model)
+        client = create_async_client(config, provider)
+        try:
+            response = await open_stream(client, provider, path, payload)
+            line_iterator = response.aiter_lines()
+            first_line = ""
+            async for line in line_iterator:
+                if not line:
+                    continue
+                first_line = line
+                break
+            if not first_line:
+                await response.aclose()
+                await client.aclose()
+                raise ProviderError(
+                    f"Provider {provider.name} returned an empty stream",
+                    retryable=False,
+                    base_url=provider.base_url,
+                    path=path,
+                )
+            return _live_stream_passthrough(
+                inbound_protocol=inbound_protocol,
+                request_id=request_id,
+                canonical_request=canonical_request,
+                provider=provider,
+                adapter=adapter,
+                runtime=runtime,
+                api_key=api_key,
+                store=store,
+                config=config,
+                started_perf=started_perf,
+                first_line=first_line,
+                client=client,
+                response=response,
+                line_iterator=line_iterator,
             )
-        return _live_stream_passthrough(
-            inbound_protocol=inbound_protocol,
-            request_id=request_id,
-            canonical_request=canonical_request,
-            provider=provider,
-            adapter=adapter,
-            runtime=runtime,
-            api_key=api_key,
-            store=store,
-            config=config,
-            started_perf=started_perf,
-            first_line=first_line,
-            client=client,
-            response=response,
-            line_iterator=line_iterator,
-        )
-    except Exception:
-        await client.aclose()
-        raise
+        except ProviderError as exc:
+            last_error = exc
+            await client.aclose()
+            continue
+        except Exception:
+            await client.aclose()
+            raise
+    if last_error is not None:
+        raise last_error
+    raise ProviderError("No providers available for live stream", retryable=False)
 
 
 async def _live_stream_bridge_oaichat_to_oairesp(
@@ -831,9 +845,8 @@ async def _live_stream_bridge_oaichat_to_oairesp(
     )
 
 
-async def _prepare_live_stream_bridge(
+async def _live_stream_bridge_anthropic_to_oairesp(
     *,
-    inbound_protocol: ProtocolName,
     request_id: str,
     canonical_request: Any,
     provider: ProviderConfig,
@@ -843,53 +856,159 @@ async def _prepare_live_stream_bridge(
     store: ConversationStore,
     config: AppConfig,
     started_perf: float,
+    first_line: str,
+    client: Any,
+    response: Any,
+    line_iterator: AsyncIterator[str],
 ) -> AsyncIterator[str]:
-    outbound_adapter = get_adapter(provider.protocol)
-    mapped_model = provider.map_model(canonical_request.requested_model)
-    path, payload = outbound_adapter.build_request(canonical_request, mapped_model)
-    client = create_async_client(config, provider)
+    anthropic_state = init_anthropic_stream_state(provider.protocol)
+    first_events = process_anthropic_stream_line(anthropic_state, first_line)
+    formatter_state = init_response_stream_formatter_state(
+        CanonicalResponse(
+            response_id=anthropic_state.response_id,
+            protocol_out="oairesp",
+            model=anthropic_state.model,
+            created_at=int(time.time()),
+        )
+    )
     try:
-        response = await open_stream(client, provider, path, payload)
-        line_iterator = response.aiter_lines()
-        first_line = ""
+        for chunk in iter_response_stream_events(formatter_state, first_events):
+            yield chunk
         async for line in line_iterator:
             if not line:
                 continue
-            first_line = line
-            break
-        if not first_line:
+            events = process_anthropic_stream_line(anthropic_state, line)
+            formatter_state.response.model = anthropic_state.model or formatter_state.response.model
+            for chunk in iter_response_stream_events(formatter_state, events):
+                yield chunk
+    finally:
+        await response.aclose()
+        await client.aclose()
+
+    final_response, _final_events = build_anthropic_stream_result(anthropic_state)
+    formatter_state.response = CanonicalResponse(
+        response_id=final_response.response_id,
+        protocol_out="oairesp",
+        model=final_response.model,
+        created_at=final_response.created_at,
+        output_messages=final_response.output_messages,
+        usage=final_response.usage,
+        metadata=final_response.metadata,
+    )
+    for chunk in finalize_response_stream(formatter_state):
+        yield chunk
+    if runtime is not None and api_key is not None:
+        runtime.record_usage(
+            api_key=api_key,
+            request_id=request_id,
+            request=canonical_request,
+            response=final_response,
+            provider_name=provider.name,
+            latency_ms=int((time.perf_counter() - started_perf) * 1000),
+        )
+        await runtime.publish_request_event(
+            {
+                "request_id": request_id,
+                "api_key": api_key.name,
+                "provider": provider.name,
+                "model": canonical_request.requested_model,
+                "status": "success",
+            }
+        )
+    _save_conversation(
+        store,
+        adapter.format_response(final_response),
+        final_response.model,
+        final_response.output_messages,
+        canonical_request.metadata,
+        config.storage.ttl_seconds,
+    )
+
+
+async def _prepare_live_stream_bridge(
+    *,
+    inbound_protocol: ProtocolName,
+    request_id: str,
+    canonical_request: Any,
+    providers: list[ProviderConfig],
+    adapter: Any,
+    runtime: RuntimeManager | None,
+    api_key: AuthenticatedApiKey | None,
+    store: ConversationStore,
+    config: AppConfig,
+    started_perf: float,
+) -> AsyncIterator[str]:
+    last_error: ProviderError | None = None
+    for provider in providers:
+        outbound_adapter = get_adapter(provider.protocol)
+        mapped_model = provider.map_model(canonical_request.requested_model)
+        path, payload = outbound_adapter.build_request(canonical_request, mapped_model)
+        client = create_async_client(config, provider)
+        try:
+            response = await open_stream(client, provider, path, payload)
+            line_iterator = response.aiter_lines()
+            first_line = ""
+            async for line in line_iterator:
+                if not line:
+                    continue
+                first_line = line
+                break
+            if not first_line:
+                await response.aclose()
+                await client.aclose()
+                raise ProviderError(
+                    f"Provider {provider.name} returned an empty stream",
+                    retryable=False,
+                    base_url=provider.base_url,
+                    path=path,
+                )
+            if inbound_protocol == "oairesp" and provider.protocol == "oaichat":
+                return _live_stream_bridge_oaichat_to_oairesp(
+                    request_id=request_id,
+                    canonical_request=canonical_request,
+                    provider=provider,
+                    adapter=adapter,
+                    runtime=runtime,
+                    api_key=api_key,
+                    store=store,
+                    config=config,
+                    started_perf=started_perf,
+                    first_line=first_line,
+                    client=client,
+                    response=response,
+                    line_iterator=line_iterator,
+                )
+            if inbound_protocol == "oairesp" and provider.protocol == "anthropic":
+                return _live_stream_bridge_anthropic_to_oairesp(
+                    request_id=request_id,
+                    canonical_request=canonical_request,
+                    provider=provider,
+                    adapter=adapter,
+                    runtime=runtime,
+                    api_key=api_key,
+                    store=store,
+                    config=config,
+                    started_perf=started_perf,
+                    first_line=first_line,
+                    client=client,
+                    response=response,
+                    line_iterator=line_iterator,
+                )
             await response.aclose()
             await client.aclose()
             raise ProviderError(
-                f"Provider {provider.name} returned an empty stream",
+                f"Unsupported live stream bridge {provider.protocol}->{inbound_protocol}",
                 retryable=False,
                 base_url=provider.base_url,
                 path=path,
             )
-        if inbound_protocol == "oairesp" and provider.protocol == "oaichat":
-            return _live_stream_bridge_oaichat_to_oairesp(
-                request_id=request_id,
-                canonical_request=canonical_request,
-                provider=provider,
-                adapter=adapter,
-                runtime=runtime,
-                api_key=api_key,
-                store=store,
-                config=config,
-                started_perf=started_perf,
-                first_line=first_line,
-                client=client,
-                response=response,
-                line_iterator=line_iterator,
-            )
-        await response.aclose()
-        await client.aclose()
-        raise ProviderError(
-            f"Unsupported live stream bridge {provider.protocol}->{inbound_protocol}",
-            retryable=False,
-            base_url=provider.base_url,
-            path=path,
-        )
-    except Exception:
-        await client.aclose()
-        raise
+        except ProviderError as exc:
+            last_error = exc
+            await client.aclose()
+            continue
+        except Exception:
+            await client.aclose()
+            raise
+    if last_error is not None:
+        raise last_error
+    raise ProviderError("No providers available for live stream bridge", retryable=False)
