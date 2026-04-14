@@ -161,162 +161,10 @@ class OpenAIResponsesAdapter:
         lines: AsyncIterator[str],
         protocol_out: str,
     ) -> tuple[CanonicalResponse, list[CanonicalStreamEvent]]:
-        response_id = f"resp_{uuid.uuid4().hex}"
-        item_id = f"msg_{uuid.uuid4().hex}"
-        model = ""
-        text_parts: list[str] = []
-        usage = CanonicalUsage()
-        events: list[CanonicalStreamEvent] = []
-        tool_calls_by_item_id: dict[str, CanonicalToolCall] = {}
-        tool_calls_in_order: list[CanonicalToolCall] = []
-
+        state = init_responses_stream_state(protocol_out)
         async for line in lines:
-            if not line.startswith("data: "):
-                continue
-            raw = line[6:]
-            if raw == "[DONE]":
-                break
-            payload = json.loads(raw)
-            payload_type = payload.get("type") if isinstance(payload.get("type"), str) else None
-            payload_object = (
-                payload.get("object") if isinstance(payload.get("object"), str) else None
-            )
-            response_event_type = payload_type or payload_object
-            if isinstance(response_event_type, str) and response_event_type.startswith("response."):
-                logger.bind(request_id="-", provider="-", round=0, attempt=0).debug(
-                    "parsed upstream oairesp event type={} keys={}",
-                    response_event_type,
-                    sorted(payload.keys()),
-                )
-                if isinstance(payload.get("model"), str):
-                    model = payload["model"]
-                response_payload = payload.get("response")
-                if (
-                    not model
-                    and isinstance(response_payload, dict)
-                    and isinstance(response_payload.get("model"), str)
-                ):
-                    model = response_payload["model"]
-                if response_event_type == "response.output_text.delta" and isinstance(
-                    payload.get("delta"), str
-                ):
-                    text_parts.append(payload["delta"])
-                    events.append(
-                        CanonicalStreamEvent(
-                            event_type="text_delta",
-                            response_id=response_id,
-                            item_id=item_id,
-                            delta=payload["delta"],
-                        )
-                    )
-                elif response_event_type == "response.function_call_arguments.delta" and isinstance(
-                    payload.get("item_id"), str
-                ):
-                    item_id_value = payload["item_id"]
-                    tool_call = tool_calls_by_item_id.get(item_id_value)
-                    if tool_call is None:
-                        tool_call = CanonicalToolCall(id=item_id_value, name="", arguments="")
-                        tool_calls_by_item_id[item_id_value] = tool_call
-                        tool_calls_in_order.append(tool_call)
-                    if isinstance(payload.get("delta"), str):
-                        tool_call.arguments += payload["delta"]
-                        events.append(
-                            CanonicalStreamEvent(
-                                event_type="function_call_arguments_delta",
-                                response_id=response_id,
-                                item_id=item_id_value,
-                                delta=payload["delta"],
-                            )
-                        )
-                elif response_event_type == "response.output_item.done" and isinstance(
-                    payload.get("item"), dict
-                ):
-                    item_payload = payload["item"]
-                    if item_payload.get("type") == "function_call" and isinstance(
-                        item_payload.get("id"), str
-                    ):
-                        item_id_value = item_payload["id"]
-                        call_id = item_payload.get("call_id")
-                        tool_call = tool_calls_by_item_id.get(item_id_value)
-                        if tool_call is None:
-                            tool_call = CanonicalToolCall(
-                                id=call_id
-                                if isinstance(call_id, str) and call_id
-                                else item_id_value,
-                                name=item_payload.get("name")
-                                if isinstance(item_payload.get("name"), str)
-                                else "",
-                                arguments=item_payload.get("arguments")
-                                if isinstance(item_payload.get("arguments"), str)
-                                else "",
-                            )
-                            tool_calls_by_item_id[item_id_value] = tool_call
-                            tool_calls_in_order.append(tool_call)
-                        else:
-                            if isinstance(call_id, str) and call_id:
-                                tool_call.id = call_id
-                            if isinstance(item_payload.get("name"), str):
-                                tool_call.name = item_payload["name"]
-                            if isinstance(item_payload.get("arguments"), str):
-                                tool_call.arguments = item_payload["arguments"]
-                completed = response_payload
-                if isinstance(completed, dict) and isinstance(completed.get("usage"), dict):
-                    usage = CanonicalUsage(
-                        input_tokens=int(
-                            completed["usage"].get("input_tokens", usage.input_tokens)
-                        ),
-                        cached_input_tokens=int(
-                            completed["usage"]
-                            .get("input_tokens_details", {})
-                            .get("cached_tokens", usage.cached_input_tokens)
-                        ),
-                        output_tokens=int(
-                            completed["usage"].get("output_tokens", usage.output_tokens)
-                        ),
-                        total_tokens=int(
-                            completed["usage"].get("total_tokens", usage.total_tokens)
-                        ),
-                    )
-                logger.bind(request_id="-", provider="-", round=0, attempt=0).debug(
-                    "oairesp parse_stream state model={} text_len={} events={} usage={}",
-                    model,
-                    len("".join(text_parts)),
-                    len(events),
-                    usage.model_dump(mode="json"),
-                )
-                continue
-
-            chat_response, chat_events = await self._chat_adapter.parse_stream(
-                _single_line_stream(payload), protocol_out
-            )
-            response_id = chat_response.response_id
-            model = chat_response.model
-            usage = chat_response.usage
-            text_parts = [part.text or "" for part in chat_response.output_messages[0].content]
-            events.extend(chat_events)
-
-        response = CanonicalResponse(
-            response_id=response_id,
-            protocol_out=_normalize_protocol(protocol_out, "oairesp"),
-            model=model,
-            created_at=int(time.time()),
-            output_messages=[
-                CanonicalMessage(
-                    role="assistant",
-                    content=[CanonicalContentPart(type="text", text="".join(text_parts))],
-                    tool_calls=tool_calls_in_order,
-                )
-            ],
-            usage=usage,
-        )
-        logger.bind(request_id="-", provider="-", round=0, attempt=0).debug(
-            "oairesp parse_stream completed response_id={} model={} final_text={!r} event_count={}",
-            response_id,
-            model,
-            "".join(text_parts),
-            len(events),
-        )
-        return response, events
+            await process_responses_stream_line(state, line, self._chat_adapter, protocol_out)
+        return build_responses_stream_result(state)
 
     def format_response(self, response: CanonicalResponse) -> dict[str, Any]:
         message = (
@@ -453,6 +301,157 @@ def init_response_stream_formatter_state(
     }
     state.created_event_chunk = f"data: {json.dumps(created_event)}\n\n"
     return state
+
+
+@dataclass
+class ResponsesStreamState:
+    protocol_out: str
+    response_id: str = field(default_factory=lambda: f"resp_{uuid.uuid4().hex}")
+    item_id: str = field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
+    model: str = ""
+    text_parts: list[str] = field(default_factory=list)
+    usage: CanonicalUsage = field(default_factory=CanonicalUsage)
+    events: list[CanonicalStreamEvent] = field(default_factory=list)
+    tool_calls_by_item_id: dict[str, CanonicalToolCall] = field(default_factory=dict)
+    tool_calls_in_order: list[CanonicalToolCall] = field(default_factory=list)
+
+
+def init_responses_stream_state(protocol_out: str) -> ResponsesStreamState:
+    return ResponsesStreamState(protocol_out=protocol_out)
+
+
+async def process_responses_stream_line(
+    state: ResponsesStreamState,
+    line: str,
+    chat_adapter: OpenAIChatAdapter,
+    protocol_out: str,
+) -> list[CanonicalStreamEvent]:
+    if not line.startswith("data: "):
+        return []
+    raw = line[6:]
+    if raw == "[DONE]":
+        return []
+    payload = json.loads(raw)
+    payload_type = payload.get("type") if isinstance(payload.get("type"), str) else None
+    payload_object = payload.get("object") if isinstance(payload.get("object"), str) else None
+    response_event_type = payload_type or payload_object
+    emitted: list[CanonicalStreamEvent] = []
+    if isinstance(response_event_type, str) and response_event_type.startswith("response."):
+        if isinstance(payload.get("model"), str):
+            state.model = payload["model"]
+        response_payload = payload.get("response")
+        if (
+            not state.model
+            and isinstance(response_payload, dict)
+            and isinstance(response_payload.get("model"), str)
+        ):
+            state.model = response_payload["model"]
+        if response_event_type == "response.output_text.delta" and isinstance(
+            payload.get("delta"), str
+        ):
+            state.text_parts.append(payload["delta"])
+            event = CanonicalStreamEvent(
+                event_type="text_delta",
+                response_id=state.response_id,
+                item_id=state.item_id,
+                delta=payload["delta"],
+            )
+            state.events.append(event)
+            emitted.append(event)
+        elif response_event_type == "response.function_call_arguments.delta" and isinstance(
+            payload.get("item_id"), str
+        ):
+            item_id_value = payload["item_id"]
+            tool_call = state.tool_calls_by_item_id.get(item_id_value)
+            if tool_call is None:
+                tool_call = CanonicalToolCall(id=item_id_value, name="", arguments="")
+                state.tool_calls_by_item_id[item_id_value] = tool_call
+                state.tool_calls_in_order.append(tool_call)
+            if isinstance(payload.get("delta"), str):
+                tool_call.arguments += payload["delta"]
+                event = CanonicalStreamEvent(
+                    event_type="function_call_arguments_delta",
+                    response_id=state.response_id,
+                    item_id=item_id_value,
+                    delta=payload["delta"],
+                )
+                state.events.append(event)
+                emitted.append(event)
+        elif response_event_type == "response.output_item.done" and isinstance(
+            payload.get("item"), dict
+        ):
+            item_payload = payload["item"]
+            if item_payload.get("type") == "function_call" and isinstance(
+                item_payload.get("id"), str
+            ):
+                item_id_value = item_payload["id"]
+                call_id = item_payload.get("call_id")
+                tool_call = state.tool_calls_by_item_id.get(item_id_value)
+                if tool_call is None:
+                    tool_call = CanonicalToolCall(
+                        id=call_id if isinstance(call_id, str) and call_id else item_id_value,
+                        name=item_payload.get("name")
+                        if isinstance(item_payload.get("name"), str)
+                        else "",
+                        arguments=item_payload.get("arguments")
+                        if isinstance(item_payload.get("arguments"), str)
+                        else "",
+                    )
+                    state.tool_calls_by_item_id[item_id_value] = tool_call
+                    state.tool_calls_in_order.append(tool_call)
+                else:
+                    if isinstance(call_id, str) and call_id:
+                        tool_call.id = call_id
+                    if isinstance(item_payload.get("name"), str):
+                        tool_call.name = item_payload["name"]
+                    if isinstance(item_payload.get("arguments"), str):
+                        tool_call.arguments = item_payload["arguments"]
+        completed = response_payload
+        if isinstance(completed, dict) and isinstance(completed.get("usage"), dict):
+            state.usage = CanonicalUsage(
+                input_tokens=int(completed["usage"].get("input_tokens", state.usage.input_tokens)),
+                cached_input_tokens=int(
+                    completed["usage"]
+                    .get("input_tokens_details", {})
+                    .get("cached_tokens", state.usage.cached_input_tokens)
+                ),
+                output_tokens=int(
+                    completed["usage"].get("output_tokens", state.usage.output_tokens)
+                ),
+                total_tokens=int(completed["usage"].get("total_tokens", state.usage.total_tokens)),
+            )
+        return emitted
+
+    chat_response, chat_events = await chat_adapter.parse_stream(
+        _single_line_stream(payload), protocol_out
+    )
+    state.response_id = chat_response.response_id
+    state.model = chat_response.model
+    state.usage = chat_response.usage
+    state.text_parts = [part.text or "" for part in chat_response.output_messages[0].content]
+    state.events.extend(chat_events)
+    emitted.extend(chat_events)
+    return emitted
+
+
+def build_responses_stream_result(
+    state: ResponsesStreamState,
+) -> tuple[CanonicalResponse, list[CanonicalStreamEvent]]:
+    response = CanonicalResponse(
+        response_id=state.response_id,
+        protocol_out=_normalize_protocol(state.protocol_out, "oairesp"),
+        model=state.model,
+        created_at=int(time.time()),
+        output_messages=[
+            CanonicalMessage(
+                role="assistant",
+                content=[CanonicalContentPart(type="text", text="".join(state.text_parts))],
+                tool_calls=state.tool_calls_in_order,
+            )
+        ],
+        usage=state.usage,
+    )
+    return response, state.events
 
 
 def iter_response_stream_events(
