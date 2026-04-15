@@ -633,6 +633,8 @@ def _can_bridge_live_stream(
         return providers[0].protocol in {"oaichat", "anthropic"}
     if inbound_protocol == "oaichat":
         return providers[0].protocol in {"anthropic", "oairesp"}
+    if inbound_protocol == "anthropic":
+        return providers[0].protocol == "oaichat"
     return False
 
 
@@ -1106,6 +1108,93 @@ async def _live_stream_bridge_oairesp_to_oaichat(
         )
 
 
+async def _live_stream_bridge_oaichat_to_anthropic(
+    *,
+    request_id: str,
+    canonical_request: Any,
+    provider: ProviderConfig,
+    adapter: Any,
+    runtime: RuntimeManager | None,
+    api_key: AuthenticatedApiKey | None,
+    store: ConversationStore,
+    config: AppConfig,
+    started_perf: float,
+    first_line: str,
+    client: Any,
+    response: Any,
+    line_iterator: AsyncIterator[str],
+) -> AsyncIterator[str]:
+    chat_state = init_chat_stream_state(provider.protocol)
+    first_events = process_chat_stream_line(chat_state, first_line)
+    response_id = chat_state.response_id
+    model = chat_state.model
+    try:
+        start_event = {
+            "type": "message_start",
+            "message": {
+                "id": response_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        }
+        yield f"event: message_start\ndata: {json.dumps(start_event)}\n\n"
+        yield (
+            "event: content_block_start\n"
+            f"data: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        )
+        for event in first_events:
+            if event.event_type != "text_delta" or event.delta is None:
+                continue
+            yield (
+                "event: content_block_delta\n"
+                f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': event.delta}})}\n\n"
+            )
+        async for line in line_iterator:
+            if not line:
+                continue
+            events = process_chat_stream_line(chat_state, line)
+            model = chat_state.model or model
+            for event in events:
+                if event.event_type != "text_delta" or event.delta is None:
+                    continue
+                yield (
+                    "event: content_block_delta\n"
+                    f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': event.delta}})}\n\n"
+                )
+    finally:
+        await response.aclose()
+        await client.aclose()
+
+    final_response, _final_events = build_chat_stream_result(chat_state)
+    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+    yield (
+        "event: message_delta\n"
+        f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'input_tokens': final_response.usage.input_tokens, 'output_tokens': final_response.usage.output_tokens}})}\n\n"
+    )
+    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+    if runtime is not None and api_key is not None:
+        runtime.record_usage(
+            api_key=api_key,
+            request_id=request_id,
+            request=canonical_request,
+            response=final_response,
+            provider_name=provider.name,
+            latency_ms=int((time.perf_counter() - started_perf) * 1000),
+        )
+        await runtime.publish_request_event(
+            {
+                "request_id": request_id,
+                "api_key": api_key.name,
+                "provider": provider.name,
+                "model": canonical_request.requested_model,
+                "status": "success",
+            }
+        )
+
+
 async def _prepare_live_stream_bridge(
     *,
     inbound_protocol: ProtocolName,
@@ -1193,6 +1282,22 @@ async def _prepare_live_stream_bridge(
                 )
             if inbound_protocol == "oaichat" and provider.protocol == "oairesp":
                 return _live_stream_bridge_oairesp_to_oaichat(
+                    request_id=request_id,
+                    canonical_request=canonical_request,
+                    provider=provider,
+                    adapter=adapter,
+                    runtime=runtime,
+                    api_key=api_key,
+                    store=store,
+                    config=config,
+                    started_perf=started_perf,
+                    first_line=first_line,
+                    client=client,
+                    response=response,
+                    line_iterator=line_iterator,
+                )
+            if inbound_protocol == "anthropic" and provider.protocol == "oaichat":
+                return _live_stream_bridge_oaichat_to_anthropic(
                     request_id=request_id,
                     canonical_request=canonical_request,
                     provider=provider,
