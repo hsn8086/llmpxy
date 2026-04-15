@@ -124,6 +124,7 @@ class RemoteDashboardApp(App[None]):
         self._snapshot_dirty = True
         self._last_refresh_completed_at: float | None = None
         self._force_refresh = False
+        self._refresh_requested_while_in_flight = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -231,6 +232,9 @@ class RemoteDashboardApp(App[None]):
         finally:
             self._last_refresh_completed_at = time.monotonic()
             self._refresh_in_flight = False
+            if self._refresh_requested_while_in_flight:
+                self._snapshot_dirty = True
+                self._refresh_requested_while_in_flight = False
         snapshot_signature = self._snapshot_signature_for(snapshot)
         if snapshot_signature == self._snapshot_signature:
             return
@@ -239,6 +243,11 @@ class RemoteDashboardApp(App[None]):
         self._render_snapshot()
 
     def _request_refresh(self, *, force: bool = False) -> None:
+        if self._refresh_in_flight:
+            self._refresh_requested_while_in_flight = True
+            if force:
+                self._force_refresh = True
+            return
         self._snapshot_dirty = True
         if force:
             self._force_refresh = True
@@ -329,7 +338,7 @@ class RemoteDashboardApp(App[None]):
                 str(provider.get("state", "-")),
                 str(provider.get("consecutive_errors", 0)),
                 str(provider.get("recent_successes", 0)),
-                str(provider.get("recent_errors", 0)),
+                str(provider.get("recent_attempt_errors", provider.get("recent_errors", 0))),
                 str(provider.get("in_flight", 0)),
                 self._truncate(str(provider.get("last_error_message") or "-"), 36),
                 key=str(provider.get("name", "-")),
@@ -573,9 +582,13 @@ class RemoteDashboardApp(App[None]):
             [
                 f"Provider: {provider.get('name', '-')}",
                 f"Protocol: {provider.get('protocol', '-')}  State: {provider.get('state', '-')}",
-                f"Errors: consecutive={provider.get('consecutive_errors', 0)} recent={provider.get('recent_errors', 0)}",
+                (
+                    "Attempt Errors: "
+                    f"consecutive={provider.get('consecutive_errors', 0)} "
+                    f"recent={provider.get('recent_attempt_errors', provider.get('recent_errors', 0))}"
+                ),
                 f"Success: recent={provider.get('recent_successes', 0)}  InFlight: {provider.get('in_flight', 0)}",
-                f"Window(60s): req={provider.get('window', {}).get('request_count', 0)} rps={self._format_float(provider.get('window', {}).get('rps'), 2)} tok/s={self._format_float(provider.get('window', {}).get('tokens_per_second'), 2)} cache_hit={self._format_percent(provider.get('window', {}).get('cache_hit_rate'))} err_rate={self._format_percent(provider.get('window', {}).get('error_rate'))}",
+                f"Window(60s): req={provider.get('window', {}).get('request_count', 0)} request_errors={provider.get('window', {}).get('error_count', 0)} rps={self._format_float(provider.get('window', {}).get('rps'), 2)} tok/s={self._format_float(provider.get('window', {}).get('tokens_per_second'), 2)} cache_hit={self._format_percent(provider.get('window', {}).get('cache_hit_rate'))} err_rate={self._format_percent(provider.get('window', {}).get('error_rate'))}",
                 f"Window(60s): avg_latency={self._format_latency(provider.get('window', {}).get('avg_latency_ms'))} cost=${self._format_float(provider.get('window', {}).get('total_cost_usd'), 4)}",
                 f"Window(60s): in={self._format_integer(provider.get('window', {}).get('total_input_tokens'))} cached={self._format_integer(provider.get('window', {}).get('total_cached_input_tokens'))} out={self._format_integer(provider.get('window', {}).get('total_output_tokens'))}",
                 f"Last Success: {self._format_timestamp(provider.get('last_success_at'))}",
@@ -681,7 +694,7 @@ class RemoteDashboardApp(App[None]):
     def _provider_sort_key(self, provider: dict[str, Any]) -> tuple[object, ...]:
         if self._provider_sort_mode == "errors":
             return (
-                -int(provider.get("recent_errors", 0) or 0),
+                -int(provider.get("recent_attempt_errors", provider.get("recent_errors", 0)) or 0),
                 -int(provider.get("consecutive_errors", 0) or 0),
                 str(provider.get("name", "")),
             )

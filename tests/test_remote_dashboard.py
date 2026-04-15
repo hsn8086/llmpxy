@@ -128,6 +128,7 @@ async def test_remote_dashboard_renders_snapshot() -> None:
                 "state": "healthy",
                 "consecutive_errors": 0,
                 "recent_successes": 3,
+                "recent_attempt_errors": 0,
                 "recent_errors": 0,
                 "in_flight": 0,
                 "last_error_message": None,
@@ -153,6 +154,7 @@ async def test_remote_dashboard_renders_snapshot() -> None:
                 "state": "failing",
                 "consecutive_errors": 4,
                 "recent_successes": 1,
+                "recent_attempt_errors": 7,
                 "recent_errors": 2,
                 "in_flight": 1,
                 "last_error_message": "upstream timeout after retry loop",
@@ -268,8 +270,9 @@ async def test_remote_dashboard_renders_snapshot() -> None:
         rendered_provider_details = str(provider_details.render())
         assert "Provider: openai-chat-a" in rendered_provider_details
         assert "State: failing" in rendered_provider_details
+        assert "Attempt Errors: consecutive=4 recent=7" in rendered_provider_details
         assert (
-            "Window(60s): req=1 rps=0.02 tok/s=0.00 cache_hit=0.0% err_rate=100.0%"
+            "Window(60s): req=1 request_errors=1 rps=0.02 tok/s=0.00 cache_hit=0.0% err_rate=100.0%"
             in rendered_provider_details
         )
         assert "Window(60s): avg_latency=2100ms cost=$0.0000" in rendered_provider_details
@@ -877,7 +880,7 @@ async def test_remote_dashboard_keeps_single_in_flight_snapshot_request() -> Non
         "recent_requests": [],
     }
 
-    client = SlowCountingDashboardClient(snapshot, delay_seconds=0.2)
+    client = SlowCountingDashboardClient(snapshot, delay_seconds=0.5)
     app = RemoteDashboardApp(client, enable_stream=False)
     app._refresh_interval_seconds = 0.05
 
@@ -892,7 +895,7 @@ async def test_remote_dashboard_keeps_single_in_flight_snapshot_request() -> Non
 
         assert client.snapshot_calls == 1
 
-        await pilot.pause(0.25)
+        await pilot.pause(0.55)
         assert client.snapshot_calls == 2
 
 

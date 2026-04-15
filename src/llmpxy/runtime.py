@@ -190,6 +190,7 @@ class RuntimeManager:
                     "last_error_message": provider_stats.last_error_message,
                     "in_flight": provider_stats.in_flight,
                     "recent_successes": provider_stats.recent_successes,
+                    "recent_attempt_errors": provider_stats.recent_errors,
                     "recent_errors": provider_stats.recent_errors,
                     "window": provider_window,
                 }

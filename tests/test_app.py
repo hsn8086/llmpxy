@@ -2832,6 +2832,7 @@ models = { "gpt-4.1" = "a-model" }
     provider_stats = cast(list[dict[str, object]], runtime.runtime_snapshot()["providers"])[0]
     assert any('"content": "hello"' in chunk for chunk in chunks)
     assert provider_stats["recent_successes"] == 1
+    assert provider_stats["recent_attempt_errors"] == 0
     assert provider_stats["recent_errors"] == 0
     monkeypatch.setattr(httpx, "AsyncClient", original)
 

@@ -509,3 +509,43 @@ api_key_env = "UPSTREAM_A_KEY"
 
     assert cast(dict[str, object], provider["window"])["request_count"] == 1
     assert cast(dict[str, object], provider["window"])["error_count"] == 1
+    assert provider["recent_attempt_errors"] == 0
+
+
+def test_runtime_snapshot_exposes_provider_attempt_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UPSTREAM_A_KEY", "upstream-a")
+
+    config_file = tmp_path / "config.toml"
+    _write_config(
+        config_file,
+        """
+[route]
+type = "provider"
+name = "provider-a"
+
+[[api_keys]]
+uuid = "11111111-1111-1111-1111-111111111111"
+name = "client-a"
+key = "client-a"
+
+[[providers]]
+name = "provider-a"
+protocol = "oaichat"
+base_url = "https://a.example/v1"
+api_key_env = "UPSTREAM_A_KEY"
+""",
+    )
+
+    runtime = RuntimeManager(config_file)
+    runtime.stats().record_provider_error("provider-a", "transient boom")
+    runtime.stats().record_provider_error("provider-a", "transient boom again")
+
+    snapshot = runtime.runtime_snapshot()
+    providers = cast(list[dict[str, object]], snapshot["providers"])
+    provider = providers[0]
+
+    assert provider["consecutive_errors"] == 2
+    assert provider["recent_attempt_errors"] == 2
+    assert provider["recent_errors"] == 2
