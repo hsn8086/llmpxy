@@ -64,7 +64,9 @@ class ProviderDispatcher:
                     state = self._states[provider.name]
                     if state.consecutive_errors > 0:
                         last_error = ProviderError(
-                            f"Provider {provider.name} exhausted retry budget", retryable=True
+                            f"Provider {provider.name} exhausted retry budget",
+                            provider_name=provider.name,
+                            retryable=True,
                         )
                     continue
                 return result, provider
@@ -95,7 +97,9 @@ class ProviderDispatcher:
                     state = self._states[provider.name]
                     if state.consecutive_errors > 0:
                         last_error = ProviderError(
-                            f"Provider {provider.name} exhausted retry budget", retryable=True
+                            f"Provider {provider.name} exhausted retry budget",
+                            provider_name=provider.name,
+                            retryable=True,
                         )
                     continue
                 response, events = result

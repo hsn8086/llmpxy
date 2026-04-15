@@ -16,6 +16,7 @@ class ProviderError(Exception):
         self,
         message: str,
         *,
+        provider_name: str | None = None,
         retryable: bool,
         status_code: int | None = None,
         response_text: str | None = None,
@@ -25,6 +26,7 @@ class ProviderError(Exception):
         path: str | None = None,
     ) -> None:
         super().__init__(message)
+        self.provider_name = provider_name
         self.retryable = retryable
         self.status_code = status_code
         self.response_text = response_text
@@ -97,6 +99,7 @@ async def open_stream(
     except (httpx.TimeoutException, httpx.NetworkError) as exc:
         raise ProviderError(
             str(exc),
+            provider_name=provider.name,
             retryable=True,
             base_url=provider.base_url,
             proxy=str(proxy) if proxy is not None else None,
@@ -109,6 +112,7 @@ async def open_stream(
         retryable, error_code = _classify_error_response(response.status_code, response_text)
         raise ProviderError(
             f"Provider {provider.name} returned HTTP {response.status_code}",
+            provider_name=provider.name,
             retryable=retryable,
             status_code=response.status_code,
             response_text=response_text,
@@ -137,6 +141,7 @@ async def post_json(
     except (httpx.TimeoutException, httpx.NetworkError) as exc:
         raise ProviderError(
             str(exc),
+            provider_name=provider.name,
             retryable=True,
             base_url=provider.base_url,
             proxy=str(proxy) if proxy is not None else None,
@@ -147,6 +152,7 @@ async def post_json(
         retryable, error_code = _classify_error_response(response.status_code, response.text)
         raise ProviderError(
             f"Provider {provider.name} returned HTTP {response.status_code}",
+            provider_name=provider.name,
             retryable=retryable,
             status_code=response.status_code,
             response_text=response.text,
@@ -163,6 +169,7 @@ async def post_json(
             return sse_response
         raise ProviderError(
             f"Provider {provider.name} returned non-JSON response",
+            provider_name=provider.name,
             retryable=False,
             status_code=response.status_code,
             response_text=response.text,

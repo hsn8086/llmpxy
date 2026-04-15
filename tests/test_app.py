@@ -16,6 +16,7 @@ from llmpxy.models import CanonicalResponse, CanonicalUsage
 from llmpxy.protocols.anthropic_messages import AnthropicAdapter
 from llmpxy.protocols.oai_chat import OpenAIChatAdapter
 from llmpxy.protocols.oai_responses import OpenAIResponsesAdapter
+from llmpxy.runtime import RuntimeManager
 from llmpxy.storage_sqlite import SQLiteConversationStore
 
 
@@ -2628,6 +2629,7 @@ async def test_oaichat_stream_passthrough_emits_first_chunk_before_upstream_fini
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 
@@ -2721,6 +2723,7 @@ async def test_oairesp_live_bridge_from_oaichat_emits_text_deltas_early(
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream-oairesp.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 
@@ -2739,6 +2742,97 @@ async def test_oairesp_live_bridge_from_oaichat_emits_text_deltas_early(
     assert second_chunk_released.is_set()
     assert any('"delta": "Hel"' in chunk for chunk in deltas)
     assert any('"delta": "lo"' in chunk for chunk in deltas)
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+@pytest.mark.asyncio
+async def test_live_stream_passthrough_updates_provider_runtime_stats(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("UPSTREAM_A_KEY", "upstream-a")
+
+    import httpx
+
+    async def stream_success() -> AsyncIterator[bytes]:
+        chunk = json.dumps(
+            {
+                "id": "chat1",
+                "model": "a-model",
+                "choices": [{"delta": {"content": "hello"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+        )
+        yield f"data: {chunk}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=stream_success(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[route]
+type = "provider"
+name = "provider-a"
+
+[[api_keys]]
+uuid = "11111111-1111-1111-1111-111111111111"
+name = "client-a"
+key = "client-a"
+
+[[providers]]
+name = "provider-a"
+protocol = "oaichat"
+base_url = "https://a.example/v1"
+api_key_env = "UPSTREAM_A_KEY"
+models = { "gpt-4.1" = "a-model" }
+""",
+        encoding="utf-8",
+    )
+    runtime = RuntimeManager(config_file)
+    api_key = runtime.authenticate("Bearer client-a")
+    adapter = OpenAIChatAdapter()
+    canonical_request = adapter.parse_request(
+        {
+            "model": "gpt-4.1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+        strip_unsupported_fields=True,
+    )
+
+    generator = await _prepare_live_stream_passthrough(
+        inbound_protocol="oaichat",
+        request_id="req-live-runtime",
+        canonical_request=canonical_request,
+        providers=runtime.current().config.providers,
+        adapter=adapter,
+        runtime=runtime,
+        api_key=api_key,
+        store=runtime.current().store,
+        config=runtime.current().config,
+        started_at=int(asyncio.get_event_loop().time()),
+        started_perf=0.0,
+    )
+
+    chunks = [chunk async for chunk in generator]
+
+    provider_stats = cast(list[dict[str, object]], runtime.runtime_snapshot()["providers"])[0]
+    assert any('"content": "hello"' in chunk for chunk in chunks)
+    assert provider_stats["recent_successes"] == 1
+    assert provider_stats["recent_errors"] == 0
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
@@ -2841,6 +2935,7 @@ async def test_oairesp_live_bridge_from_oaichat_emits_tool_call_deltas(
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream-oairesp-oaichat-tools.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 
@@ -2918,6 +3013,7 @@ async def test_oairesp_live_bridge_from_anthropic_emits_text_deltas_early(
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream-oairesp-anthropic.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 
@@ -3005,6 +3101,7 @@ async def test_oaichat_live_bridge_from_anthropic_emits_text_deltas_early(
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream-oaichat-anthropic.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 
@@ -3087,6 +3184,7 @@ async def test_oaichat_live_bridge_from_oairesp_emits_text_deltas_early(
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream-oaichat-oairesp.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 
@@ -3163,6 +3261,7 @@ async def test_oaichat_live_bridge_from_oairesp_emits_tool_call_deltas(
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream-oaichat-oairesp-tools.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 
@@ -3255,6 +3354,7 @@ async def test_anthropic_live_bridge_from_oaichat_emits_text_deltas_early(
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream-anthropic-oaichat.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 
@@ -3380,6 +3480,7 @@ async def test_anthropic_live_bridge_from_oaichat_emits_tool_use_deltas(
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream-anthropic-oaichat-tools.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 
@@ -3451,6 +3552,7 @@ async def test_oaichat_live_bridge_from_anthropic_emits_tool_call_deltas(
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream-oaichat-anthropic-tools.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 
@@ -3521,6 +3623,7 @@ async def test_oairesp_live_bridge_from_anthropic_emits_tool_call_deltas(
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream-oairesp-anthropic-tools.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 
@@ -3600,6 +3703,7 @@ async def test_anthropic_live_bridge_from_oairesp_emits_text_deltas_early(
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream-anthropic-oairesp.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 
@@ -3685,6 +3789,7 @@ async def test_anthropic_live_bridge_from_oairesp_emits_tool_use_deltas(
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream-anthropic-oairesp-tools.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 
@@ -3764,6 +3869,7 @@ async def test_anthropic_live_bridge_from_oairesp_emits_text_deltas_early(
         api_key=None,
         store=SQLiteConversationStore(tmp_path / "live-stream-anthropic-oairesp.db"),
         config=config,
+        started_at=0,
         started_perf=0.0,
     )
 

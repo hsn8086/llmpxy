@@ -425,6 +425,7 @@ api_key_env = "UPSTREAM_A_KEY"
     runtime.record_usage(
         api_key=api_key,
         request_id="req-latency",
+        started_at=1234567890,
         request=CanonicalRequest(
             protocol_in="oaichat",
             requested_model="gpt-4.1",
@@ -453,4 +454,58 @@ api_key_env = "UPSTREAM_A_KEY"
     )
 
     event = runtime.current().store.list_recent_request_events(1)[0]
+    assert event.started_at == 1234567890
     assert event.latency_ms == 123
+
+
+def test_runtime_snapshot_counts_provider_errors_by_provider_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UPSTREAM_A_KEY", "upstream-a")
+
+    config_file = tmp_path / "config.toml"
+    _write_config(
+        config_file,
+        """
+[route]
+type = "provider"
+name = "provider-a"
+
+[[api_keys]]
+uuid = "11111111-1111-1111-1111-111111111111"
+name = "client-a"
+key = "client-a"
+
+[[providers]]
+name = "provider-a"
+protocol = "oaichat"
+base_url = "https://a.example/v1"
+api_key_env = "UPSTREAM_A_KEY"
+""",
+    )
+
+    runtime = RuntimeManager(config_file)
+    now = int(time.time())
+    runtime.current().store.put_request_event(
+        RequestEventRecord(
+            request_id="req-provider-error",
+            started_at=now,
+            finished_at=now,
+            latency_ms=42,
+            protocol_in="oaichat",
+            api_key_uuid="11111111-1111-1111-1111-111111111111",
+            api_key_name="client-a",
+            provider_name="provider-a",
+            requested_model="gpt-4.1",
+            status="provider_error",
+            http_status=502,
+            error_message="boom",
+        )
+    )
+
+    snapshot = runtime.runtime_snapshot()
+    providers = cast(list[dict[str, object]], snapshot["providers"])
+    provider = providers[0]
+
+    assert cast(dict[str, object], provider["window"])["request_count"] == 1
+    assert cast(dict[str, object], provider["window"])["error_count"] == 1

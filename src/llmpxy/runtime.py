@@ -102,6 +102,7 @@ class RuntimeManager:
         *,
         api_key: AuthenticatedApiKey,
         request_id: str,
+        started_at: int,
         request: CanonicalRequest,
         response: CanonicalResponse,
         provider_name: str,
@@ -133,7 +134,7 @@ class RuntimeManager:
         state.store.put_request_event(
             RequestEventRecord(
                 request_id=request_id,
-                started_at=response.created_at,
+                started_at=started_at,
                 finished_at=int(time.time()),
                 latency_ms=max(latency_ms, 0),
                 protocol_in=request.protocol_in,

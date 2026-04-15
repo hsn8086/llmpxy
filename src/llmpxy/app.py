@@ -205,6 +205,7 @@ async def _handle_protocol_request(
     inbound_protocol: ProtocolName,
 ) -> Response:
     request_id = str(uuid.uuid4())
+    started_at = int(time.time())
     started_perf = time.perf_counter()
     payload = await request.json()
     if not isinstance(payload, dict):
@@ -252,6 +253,7 @@ async def _handle_protocol_request(
                         api_key=None,
                         store=store,
                         config=config,
+                        started_at=started_at,
                         started_perf=started_perf,
                     ),
                     media_type=_stream_media_type(inbound_protocol),
@@ -269,6 +271,7 @@ async def _handle_protocol_request(
                         api_key=None,
                         store=store,
                         config=config,
+                        started_at=started_at,
                         started_perf=started_perf,
                     ),
                     media_type=_stream_media_type(inbound_protocol),
@@ -400,6 +403,7 @@ async def _handle_protocol_request_with_api_key(
                         api_key=api_key,
                         store=store,
                         config=config,
+                        started_at=started_at,
                         started_perf=started_perf,
                     ),
                     media_type=_stream_media_type(inbound_protocol),
@@ -417,6 +421,7 @@ async def _handle_protocol_request_with_api_key(
                         api_key=api_key,
                         store=store,
                         config=config,
+                        started_at=started_at,
                         started_perf=started_perf,
                     ),
                     media_type=_stream_media_type(inbound_protocol),
@@ -439,6 +444,7 @@ async def _handle_protocol_request_with_api_key(
             runtime.record_usage(
                 api_key=api_key,
                 request_id=request_id,
+                started_at=started_at,
                 request=canonical_request,
                 response=response,
                 provider_name=provider.name,
@@ -467,6 +473,7 @@ async def _handle_protocol_request_with_api_key(
         runtime.record_usage(
             api_key=api_key,
             request_id=request_id,
+            started_at=started_at,
             request=canonical_request,
             response=response,
             provider_name=provider.name,
@@ -494,6 +501,7 @@ async def _handle_protocol_request_with_api_key(
                 stream=canonical_request.stream,
                 api_key_uuid=api_key.uuid,
                 api_key_name=api_key.name,
+                provider_name=exc.provider_name,
                 requested_model=canonical_request.requested_model,
                 status="provider_error",
                 http_status=exc.status_code or 502,
@@ -527,6 +535,7 @@ async def _handle_protocol_request_with_api_key(
                 stream=canonical_request.stream,
                 api_key_uuid=api_key.uuid,
                 api_key_name=api_key.name,
+                provider_name=exc.last_error.provider_name if exc.last_error is not None else None,
                 requested_model=canonical_request.requested_model,
                 status="all_failed",
                 http_status=502,
@@ -612,6 +621,26 @@ def _stream_headers() -> dict[str, str]:
     }
 
 
+def _record_live_provider_attempt(runtime: RuntimeManager | None, provider_name: str) -> None:
+    if runtime is None:
+        return
+    runtime.stats().record_provider_attempt(provider_name)
+
+
+def _record_live_provider_success(runtime: RuntimeManager | None, provider_name: str) -> None:
+    if runtime is None:
+        return
+    runtime.stats().record_provider_success(provider_name)
+
+
+def _record_live_provider_error(
+    runtime: RuntimeManager | None, provider_name: str, message: str
+) -> None:
+    if runtime is None:
+        return
+    runtime.stats().record_provider_error(provider_name, message)
+
+
 def _can_passthrough_live_stream(
     inbound_protocol: ProtocolName, providers: list[ProviderConfig]
 ) -> bool:
@@ -649,6 +678,7 @@ async def _live_stream_passthrough(
     api_key: AuthenticatedApiKey | None,
     store: ConversationStore,
     config: AppConfig,
+    started_at: int,
     started_perf: float,
     first_line: str,
     client: Any,
@@ -674,10 +704,12 @@ async def _live_stream_passthrough(
             yield line
 
     response, _events = await outbound_adapter.parse_stream(replay_lines(), provider.protocol)
+    _record_live_provider_success(runtime, provider.name)
     if runtime is not None and api_key is not None:
         runtime.record_usage(
             api_key=api_key,
             request_id=request_id,
+            started_at=started_at,
             request=canonical_request,
             response=response,
             provider_name=provider.name,
@@ -714,10 +746,12 @@ async def _prepare_live_stream_passthrough(
     api_key: AuthenticatedApiKey | None,
     store: ConversationStore,
     config: AppConfig,
+    started_at: int,
     started_perf: float,
 ) -> AsyncIterator[str]:
     last_error: ProviderError | None = None
     for provider in providers:
+        _record_live_provider_attempt(runtime, provider.name)
         outbound_adapter = get_adapter(provider.protocol)
         mapped_model = provider.map_model(canonical_request.requested_model)
         path, payload = outbound_adapter.build_request(canonical_request, mapped_model)
@@ -736,6 +770,7 @@ async def _prepare_live_stream_passthrough(
                 await client.aclose()
                 raise ProviderError(
                     f"Provider {provider.name} returned an empty stream",
+                    provider_name=provider.name,
                     retryable=False,
                     base_url=provider.base_url,
                     path=path,
@@ -750,6 +785,7 @@ async def _prepare_live_stream_passthrough(
                 api_key=api_key,
                 store=store,
                 config=config,
+                started_at=started_at,
                 started_perf=started_perf,
                 first_line=first_line,
                 client=client,
@@ -758,6 +794,7 @@ async def _prepare_live_stream_passthrough(
             )
         except ProviderError as exc:
             last_error = exc
+            _record_live_provider_error(runtime, provider.name, str(exc))
             await client.aclose()
             continue
         except Exception:
@@ -778,6 +815,7 @@ async def _live_stream_bridge_oaichat_to_oairesp(
     api_key: AuthenticatedApiKey | None,
     store: ConversationStore,
     config: AppConfig,
+    started_at: int,
     started_perf: float,
     first_line: str,
     client: Any,
@@ -826,10 +864,12 @@ async def _live_stream_bridge_oaichat_to_oairesp(
     )
     for chunk in finalize_response_stream(formatter_state):
         yield chunk
+    _record_live_provider_success(runtime, provider.name)
     if runtime is not None and api_key is not None:
         runtime.record_usage(
             api_key=api_key,
             request_id=request_id,
+            started_at=started_at,
             request=canonical_request,
             response=final_response,
             provider_name=provider.name,
@@ -864,6 +904,7 @@ async def _live_stream_bridge_anthropic_to_oairesp(
     api_key: AuthenticatedApiKey | None,
     store: ConversationStore,
     config: AppConfig,
+    started_at: int,
     started_perf: float,
     first_line: str,
     client: Any,
@@ -906,10 +947,12 @@ async def _live_stream_bridge_anthropic_to_oairesp(
     )
     for chunk in finalize_response_stream(formatter_state):
         yield chunk
+    _record_live_provider_success(runtime, provider.name)
     if runtime is not None and api_key is not None:
         runtime.record_usage(
             api_key=api_key,
             request_id=request_id,
+            started_at=started_at,
             request=canonical_request,
             response=final_response,
             provider_name=provider.name,
@@ -944,6 +987,7 @@ async def _live_stream_bridge_anthropic_to_oaichat(
     api_key: AuthenticatedApiKey | None,
     store: ConversationStore,
     config: AppConfig,
+    started_at: int,
     started_perf: float,
     first_line: str,
     client: Any,
@@ -1085,10 +1129,12 @@ async def _live_stream_bridge_anthropic_to_oaichat(
     }
     yield f"data: {json.dumps(final_chunk)}\n\n"
     yield "data: [DONE]\n\n"
+    _record_live_provider_success(runtime, provider.name)
     if runtime is not None and api_key is not None:
         runtime.record_usage(
             api_key=api_key,
             request_id=request_id,
+            started_at=started_at,
             request=canonical_request,
             response=final_response,
             provider_name=provider.name,
@@ -1115,6 +1161,7 @@ async def _live_stream_bridge_oairesp_to_oaichat(
     api_key: AuthenticatedApiKey | None,
     store: ConversationStore,
     config: AppConfig,
+    started_at: int,
     started_perf: float,
     first_line: str,
     client: Any,
@@ -1260,10 +1307,12 @@ async def _live_stream_bridge_oairesp_to_oaichat(
     }
     yield f"data: {json.dumps(final_chunk)}\n\n"
     yield "data: [DONE]\n\n"
+    _record_live_provider_success(runtime, provider.name)
     if runtime is not None and api_key is not None:
         runtime.record_usage(
             api_key=api_key,
             request_id=request_id,
+            started_at=started_at,
             request=canonical_request,
             response=final_response,
             provider_name=provider.name,
@@ -1290,6 +1339,7 @@ async def _live_stream_bridge_oaichat_to_anthropic(
     api_key: AuthenticatedApiKey | None,
     store: ConversationStore,
     config: AppConfig,
+    started_at: int,
     started_perf: float,
     first_line: str,
     client: Any,
@@ -1381,10 +1431,12 @@ async def _live_stream_bridge_oaichat_to_anthropic(
         f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'input_tokens': final_response.usage.input_tokens, 'output_tokens': final_response.usage.output_tokens}})}\n\n"
     )
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+    _record_live_provider_success(runtime, provider.name)
     if runtime is not None and api_key is not None:
         runtime.record_usage(
             api_key=api_key,
             request_id=request_id,
+            started_at=started_at,
             request=canonical_request,
             response=final_response,
             provider_name=provider.name,
@@ -1411,6 +1463,7 @@ async def _live_stream_bridge_oairesp_to_anthropic(
     api_key: AuthenticatedApiKey | None,
     store: ConversationStore,
     config: AppConfig,
+    started_at: int,
     started_perf: float,
     first_line: str,
     client: Any,
@@ -1504,10 +1557,12 @@ async def _live_stream_bridge_oairesp_to_anthropic(
         f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'input_tokens': final_response.usage.input_tokens, 'output_tokens': final_response.usage.output_tokens}})}\n\n"
     )
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+    _record_live_provider_success(runtime, provider.name)
     if runtime is not None and api_key is not None:
         runtime.record_usage(
             api_key=api_key,
             request_id=request_id,
+            started_at=started_at,
             request=canonical_request,
             response=final_response,
             provider_name=provider.name,
@@ -1535,10 +1590,12 @@ async def _prepare_live_stream_bridge(
     api_key: AuthenticatedApiKey | None,
     store: ConversationStore,
     config: AppConfig,
+    started_at: int,
     started_perf: float,
 ) -> AsyncIterator[str]:
     last_error: ProviderError | None = None
     for provider in providers:
+        _record_live_provider_attempt(runtime, provider.name)
         outbound_adapter = get_adapter(provider.protocol)
         mapped_model = provider.map_model(canonical_request.requested_model)
         path, payload = outbound_adapter.build_request(canonical_request, mapped_model)
@@ -1557,6 +1614,7 @@ async def _prepare_live_stream_bridge(
                 await client.aclose()
                 raise ProviderError(
                     f"Provider {provider.name} returned an empty stream",
+                    provider_name=provider.name,
                     retryable=False,
                     base_url=provider.base_url,
                     path=path,
@@ -1571,6 +1629,7 @@ async def _prepare_live_stream_bridge(
                     api_key=api_key,
                     store=store,
                     config=config,
+                    started_at=started_at,
                     started_perf=started_perf,
                     first_line=first_line,
                     client=client,
@@ -1587,6 +1646,7 @@ async def _prepare_live_stream_bridge(
                     api_key=api_key,
                     store=store,
                     config=config,
+                    started_at=started_at,
                     started_perf=started_perf,
                     first_line=first_line,
                     client=client,
@@ -1603,6 +1663,7 @@ async def _prepare_live_stream_bridge(
                     api_key=api_key,
                     store=store,
                     config=config,
+                    started_at=started_at,
                     started_perf=started_perf,
                     first_line=first_line,
                     client=client,
@@ -1619,6 +1680,7 @@ async def _prepare_live_stream_bridge(
                     api_key=api_key,
                     store=store,
                     config=config,
+                    started_at=started_at,
                     started_perf=started_perf,
                     first_line=first_line,
                     client=client,
@@ -1635,6 +1697,7 @@ async def _prepare_live_stream_bridge(
                     api_key=api_key,
                     store=store,
                     config=config,
+                    started_at=started_at,
                     started_perf=started_perf,
                     first_line=first_line,
                     client=client,
@@ -1651,6 +1714,7 @@ async def _prepare_live_stream_bridge(
                     api_key=api_key,
                     store=store,
                     config=config,
+                    started_at=started_at,
                     started_perf=started_perf,
                     first_line=first_line,
                     client=client,
@@ -1667,6 +1731,7 @@ async def _prepare_live_stream_bridge(
                     api_key=api_key,
                     store=store,
                     config=config,
+                    started_at=started_at,
                     started_perf=started_perf,
                     first_line=first_line,
                     client=client,
@@ -1677,12 +1742,14 @@ async def _prepare_live_stream_bridge(
             await client.aclose()
             raise ProviderError(
                 f"Unsupported live stream bridge {provider.protocol}->{inbound_protocol}",
+                provider_name=provider.name,
                 retryable=False,
                 base_url=provider.base_url,
                 path=path,
             )
         except ProviderError as exc:
             last_error = exc
+            _record_live_provider_error(runtime, provider.name, str(exc))
             await client.aclose()
             continue
         except Exception:
