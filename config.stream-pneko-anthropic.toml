@@ -1,6 +1,6 @@
 [server]
 host = "127.0.0.1"
-port = 18091
+port = 18092
 
 [admin]
 enabled = true
