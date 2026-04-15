@@ -956,25 +956,9 @@ async def _live_stream_bridge_anthropic_to_oaichat(
         response_id = anthropic_state.response_id
         created_at = int(time.time())
         model = anthropic_state.model
+        tool_indices: dict[str, int] = {}
         for event in first_events:
-            if event.event_type != "text_delta" or event.delta is None:
-                continue
-            chunk = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created_at,
-                "model": model,
-                "choices": [{"index": 0, "delta": {"content": event.delta}, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(chunk)}\n\n"
-        async for line in line_iterator:
-            if not line:
-                continue
-            events = process_anthropic_stream_line(anthropic_state, line)
-            model = anthropic_state.model or model
-            for event in events:
-                if event.event_type != "text_delta" or event.delta is None:
-                    continue
+            if event.event_type == "text_delta" and event.delta is not None:
                 chunk = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
@@ -985,6 +969,102 @@ async def _live_stream_bridge_anthropic_to_oaichat(
                     ],
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
+            elif event.event_type == "function_call_arguments_delta" and event.item_id is not None:
+                if event.item_id not in tool_indices:
+                    tool_indices[event.item_id] = len(tool_indices)
+                tool_call = next(
+                    (
+                        call
+                        for call in anthropic_state.tool_calls_in_order
+                        if call.id == event.item_id
+                    ),
+                    None,
+                )
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_at,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": tool_indices[event.item_id],
+                                        "id": event.item_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool_call.name if tool_call is not None else "",
+                                            "arguments": event.delta,
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+        async for line in line_iterator:
+            if not line:
+                continue
+            events = process_anthropic_stream_line(anthropic_state, line)
+            model = anthropic_state.model or model
+            for event in events:
+                if event.event_type == "text_delta" and event.delta is not None:
+                    chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_at,
+                        "model": model,
+                        "choices": [
+                            {"index": 0, "delta": {"content": event.delta}, "finish_reason": None}
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                elif (
+                    event.event_type == "function_call_arguments_delta"
+                    and event.item_id is not None
+                ):
+                    if event.item_id not in tool_indices:
+                        tool_indices[event.item_id] = len(tool_indices)
+                    tool_call = next(
+                        (
+                            call
+                            for call in anthropic_state.tool_calls_in_order
+                            if call.id == event.item_id
+                        ),
+                        None,
+                    )
+                    chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_at,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": tool_indices[event.item_id],
+                                            "id": event.item_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": tool_call.name
+                                                if tool_call is not None
+                                                else "",
+                                                "arguments": event.delta,
+                                            },
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
     finally:
         await response.aclose()
         await client.aclose()
@@ -1049,27 +1129,9 @@ async def _live_stream_bridge_oairesp_to_oaichat(
         response_id = responses_state.response_id
         created_at = int(time.time())
         model = responses_state.model
+        tool_indices: dict[str, int] = {}
         for event in first_events:
-            if event.event_type != "text_delta" or event.delta is None:
-                continue
-            chunk = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created_at,
-                "model": model,
-                "choices": [{"index": 0, "delta": {"content": event.delta}, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(chunk)}\n\n"
-        async for line in line_iterator:
-            if not line:
-                continue
-            events = await process_responses_stream_line(
-                responses_state, line, OpenAIChatAdapter(), provider.protocol
-            )
-            model = responses_state.model or model
-            for event in events:
-                if event.event_type != "text_delta" or event.delta is None:
-                    continue
+            if event.event_type == "text_delta" and event.delta is not None:
                 chunk = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
@@ -1080,14 +1142,124 @@ async def _live_stream_bridge_oairesp_to_oaichat(
                     ],
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
+            elif event.event_type == "function_call_arguments_delta" and event.item_id is not None:
+                if event.item_id not in tool_indices:
+                    tool_indices[event.item_id] = len(tool_indices)
+                tool_call = next(
+                    (
+                        call
+                        for call in responses_state.tool_calls_in_order
+                        if call.id == event.item_id
+                    ),
+                    None,
+                )
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_at,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": tool_indices[event.item_id],
+                                        "id": event.item_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool_call.name if tool_call is not None else "",
+                                            "arguments": event.delta,
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+        async for line in line_iterator:
+            if not line:
+                continue
+            events = await process_responses_stream_line(
+                responses_state, line, OpenAIChatAdapter(), provider.protocol
+            )
+            model = responses_state.model or model
+            for event in events:
+                if event.event_type == "text_delta" and event.delta is not None:
+                    chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_at,
+                        "model": model,
+                        "choices": [
+                            {"index": 0, "delta": {"content": event.delta}, "finish_reason": None}
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                elif (
+                    event.event_type == "function_call_arguments_delta"
+                    and event.item_id is not None
+                ):
+                    if event.item_id not in tool_indices:
+                        tool_indices[event.item_id] = len(tool_indices)
+                    tool_call = next(
+                        (
+                            call
+                            for call in responses_state.tool_calls_in_order
+                            if call.id == event.item_id
+                        ),
+                        None,
+                    )
+                    chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_at,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": tool_indices[event.item_id],
+                                            "id": event.item_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": tool_call.name
+                                                if tool_call is not None
+                                                else "",
+                                                "arguments": event.delta,
+                                            },
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
     finally:
         await response.aclose()
         await client.aclose()
 
-    final_response, final_events = build_responses_stream_result(responses_state)
+    final_response, _final_events = build_responses_stream_result(responses_state)
     final_response.protocol_out = "oaichat"
-    async for chunk in OpenAIChatAdapter().format_stream(final_response, final_events):
-        yield chunk
+    final_chunk = {
+        "id": final_response.response_id,
+        "object": "chat.completion.chunk",
+        "created": final_response.created_at,
+        "model": final_response.model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": final_response.usage.input_tokens,
+            "completion_tokens": final_response.usage.output_tokens,
+            "total_tokens": final_response.usage.total_tokens,
+        },
+    }
+    yield f"data: {json.dumps(final_chunk)}\n\n"
+    yield "data: [DONE]\n\n"
     if runtime is not None and api_key is not None:
         runtime.record_usage(
             api_key=api_key,
@@ -1128,6 +1300,7 @@ async def _live_stream_bridge_oaichat_to_anthropic(
     first_events = process_chat_stream_line(chat_state, first_line)
     response_id = chat_state.response_id
     model = chat_state.model
+    tool_indices: dict[str, int] = {}
     try:
         start_event = {
             "type": "message_start",
@@ -1146,30 +1319,63 @@ async def _live_stream_bridge_oaichat_to_anthropic(
             f"data: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
         )
         for event in first_events:
-            if event.event_type != "text_delta" or event.delta is None:
-                continue
-            yield (
-                "event: content_block_delta\n"
-                f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': event.delta}})}\n\n"
-            )
+            if event.event_type == "text_delta" and event.delta is not None:
+                yield (
+                    "event: content_block_delta\n"
+                    f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': event.delta}})}\n\n"
+                )
+            elif event.event_type == "function_call_arguments_delta" and event.item_id is not None:
+                if event.item_id not in tool_indices:
+                    tool_indices[event.item_id] = len(tool_indices) + 1
+                    tool_call = next(
+                        (call for call in chat_state.tool_calls if call.id == event.item_id),
+                        None,
+                    )
+                    yield (
+                        "event: content_block_start\n"
+                        f"data: {json.dumps({'type': 'content_block_start', 'index': tool_indices[event.item_id], 'content_block': {'type': 'tool_use', 'id': event.item_id, 'name': tool_call.name if tool_call is not None else '', 'input': {}}})}\n\n"
+                    )
+                yield (
+                    "event: content_block_delta\n"
+                    f"data: {json.dumps({'type': 'content_block_delta', 'index': tool_indices[event.item_id], 'delta': {'type': 'input_json_delta', 'partial_json': event.delta}})}\n\n"
+                )
         async for line in line_iterator:
             if not line:
                 continue
             events = process_chat_stream_line(chat_state, line)
             model = chat_state.model or model
             for event in events:
-                if event.event_type != "text_delta" or event.delta is None:
-                    continue
-                yield (
-                    "event: content_block_delta\n"
-                    f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': event.delta}})}\n\n"
-                )
+                if event.event_type == "text_delta" and event.delta is not None:
+                    yield (
+                        "event: content_block_delta\n"
+                        f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': event.delta}})}\n\n"
+                    )
+                elif (
+                    event.event_type == "function_call_arguments_delta"
+                    and event.item_id is not None
+                ):
+                    if event.item_id not in tool_indices:
+                        tool_indices[event.item_id] = len(tool_indices) + 1
+                        tool_call = next(
+                            (call for call in chat_state.tool_calls if call.id == event.item_id),
+                            None,
+                        )
+                        yield (
+                            "event: content_block_start\n"
+                            f"data: {json.dumps({'type': 'content_block_start', 'index': tool_indices[event.item_id], 'content_block': {'type': 'tool_use', 'id': event.item_id, 'name': tool_call.name if tool_call is not None else '', 'input': {}}})}\n\n"
+                        )
+                    yield (
+                        "event: content_block_delta\n"
+                        f"data: {json.dumps({'type': 'content_block_delta', 'index': tool_indices[event.item_id], 'delta': {'type': 'input_json_delta', 'partial_json': event.delta}})}\n\n"
+                    )
     finally:
         await response.aclose()
         await client.aclose()
 
     final_response, _final_events = build_chat_stream_result(chat_state)
     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+    for index in tool_indices.values():
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index})}\n\n"
     yield (
         "event: message_delta\n"
         f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'input_tokens': final_response.usage.input_tokens, 'output_tokens': final_response.usage.output_tokens}})}\n\n"
@@ -1216,6 +1422,7 @@ async def _live_stream_bridge_oairesp_to_anthropic(
         responses_state, first_line, OpenAIChatAdapter(), provider.protocol
     )
     response_id = responses_state.response_id
+    tool_indices: dict[str, int] = {}
     try:
         yield (
             "event: message_start\n"
@@ -1226,12 +1433,30 @@ async def _live_stream_bridge_oairesp_to_anthropic(
             f"data: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
         )
         for event in first_events:
-            if event.event_type != "text_delta" or event.delta is None:
-                continue
-            yield (
-                "event: content_block_delta\n"
-                f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': event.delta}})}\n\n"
-            )
+            if event.event_type == "text_delta" and event.delta is not None:
+                yield (
+                    "event: content_block_delta\n"
+                    f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': event.delta}})}\n\n"
+                )
+            elif event.event_type == "function_call_arguments_delta" and event.item_id is not None:
+                if event.item_id not in tool_indices:
+                    tool_indices[event.item_id] = len(tool_indices) + 1
+                    tool_call = next(
+                        (
+                            call
+                            for call in responses_state.tool_calls_in_order
+                            if call.id == event.item_id
+                        ),
+                        None,
+                    )
+                    yield (
+                        "event: content_block_start\n"
+                        f"data: {json.dumps({'type': 'content_block_start', 'index': tool_indices[event.item_id], 'content_block': {'type': 'tool_use', 'id': event.item_id, 'name': tool_call.name if tool_call is not None else '', 'input': {}}})}\n\n"
+                    )
+                yield (
+                    "event: content_block_delta\n"
+                    f"data: {json.dumps({'type': 'content_block_delta', 'index': tool_indices[event.item_id], 'delta': {'type': 'input_json_delta', 'partial_json': event.delta}})}\n\n"
+                )
         async for line in line_iterator:
             if not line:
                 continue
@@ -1239,18 +1464,41 @@ async def _live_stream_bridge_oairesp_to_anthropic(
                 responses_state, line, OpenAIChatAdapter(), provider.protocol
             )
             for event in events:
-                if event.event_type != "text_delta" or event.delta is None:
-                    continue
-                yield (
-                    "event: content_block_delta\n"
-                    f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': event.delta}})}\n\n"
-                )
+                if event.event_type == "text_delta" and event.delta is not None:
+                    yield (
+                        "event: content_block_delta\n"
+                        f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': event.delta}})}\n\n"
+                    )
+                elif (
+                    event.event_type == "function_call_arguments_delta"
+                    and event.item_id is not None
+                ):
+                    if event.item_id not in tool_indices:
+                        tool_indices[event.item_id] = len(tool_indices) + 1
+                        tool_call = next(
+                            (
+                                call
+                                for call in responses_state.tool_calls_in_order
+                                if call.id == event.item_id
+                            ),
+                            None,
+                        )
+                        yield (
+                            "event: content_block_start\n"
+                            f"data: {json.dumps({'type': 'content_block_start', 'index': tool_indices[event.item_id], 'content_block': {'type': 'tool_use', 'id': event.item_id, 'name': tool_call.name if tool_call is not None else '', 'input': {}}})}\n\n"
+                        )
+                    yield (
+                        "event: content_block_delta\n"
+                        f"data: {json.dumps({'type': 'content_block_delta', 'index': tool_indices[event.item_id], 'delta': {'type': 'input_json_delta', 'partial_json': event.delta}})}\n\n"
+                    )
     finally:
         await response.aclose()
         await client.aclose()
 
     final_response, _final_events = build_responses_stream_result(responses_state)
     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+    for index in tool_indices.values():
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index})}\n\n"
     yield (
         "event: message_delta\n"
         f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'input_tokens': final_response.usage.input_tokens, 'output_tokens': final_response.usage.output_tokens}})}\n\n"
@@ -1379,6 +1627,22 @@ async def _prepare_live_stream_bridge(
                 )
             if inbound_protocol == "anthropic" and provider.protocol == "oaichat":
                 return _live_stream_bridge_oaichat_to_anthropic(
+                    request_id=request_id,
+                    canonical_request=canonical_request,
+                    provider=provider,
+                    adapter=adapter,
+                    runtime=runtime,
+                    api_key=api_key,
+                    store=store,
+                    config=config,
+                    started_perf=started_perf,
+                    first_line=first_line,
+                    client=client,
+                    response=response,
+                    line_iterator=line_iterator,
+                )
+            if inbound_protocol == "anthropic" and provider.protocol == "oairesp":
+                return _live_stream_bridge_oairesp_to_anthropic(
                     request_id=request_id,
                     canonical_request=canonical_request,
                     provider=provider,

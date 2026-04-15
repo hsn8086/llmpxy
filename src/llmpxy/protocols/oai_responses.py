@@ -252,6 +252,7 @@ class ResponseStreamFormatterState:
     message_output_index: int = 0
     message_opened: bool = False
     completed_item: dict[str, Any] | None = None
+    tool_call_output_index_by_id: dict[str, int] = field(default_factory=dict)
 
 
 def init_response_stream_formatter_state(
@@ -463,7 +464,53 @@ def iter_response_stream_events(
         emitted.append(state.created_event_chunk)
         state.created_event_chunk = ""
     for stream_event in events:
-        if stream_event.event_type == "text_delta" and stream_event.delta is not None:
+        if (
+            stream_event.event_type == "function_call_arguments_delta"
+            and stream_event.item_id is not None
+        ):
+            output_index = state.tool_call_output_index_by_id.get(stream_event.item_id)
+            if output_index is None:
+                output_index = len(state.tool_call_output_index_by_id)
+                state.tool_call_output_index_by_id[stream_event.item_id] = output_index
+                tool_call = (
+                    next(
+                        (
+                            call
+                            for call in state.response.output_messages[0].tool_calls
+                            if call.id == stream_event.item_id
+                        ),
+                        None,
+                    )
+                    if state.response.output_messages
+                    else None
+                )
+                state.sequence_number += 1
+                event = {
+                    "type": "response.output_item.added",
+                    "sequence_number": state.sequence_number,
+                    "output_index": output_index,
+                    "item": {
+                        "id": stream_event.item_id,
+                        "type": "function_call",
+                        "call_id": stream_event.item_id,
+                        "name": tool_call.name if tool_call is not None else "",
+                        "arguments": "",
+                        "status": "in_progress",
+                    },
+                }
+                _log_stream_event(event)
+                emitted.append(f"data: {json.dumps(event)}\n\n")
+            state.sequence_number += 1
+            event = {
+                "type": "response.function_call_arguments.delta",
+                "sequence_number": state.sequence_number,
+                "output_index": output_index,
+                "item_id": stream_event.item_id,
+                "delta": stream_event.delta or "",
+            }
+            _log_stream_event(event)
+            emitted.append(f"data: {json.dumps(event)}\n\n")
+        elif stream_event.event_type == "text_delta" and stream_event.delta is not None:
             if not state.message_opened:
                 state.message_opened = True
                 state.sequence_number += 1

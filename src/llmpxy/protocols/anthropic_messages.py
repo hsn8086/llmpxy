@@ -221,6 +221,8 @@ class AnthropicStreamState:
     model: str = ""
     usage: CanonicalUsage = field(default_factory=CanonicalUsage)
     events: list[CanonicalStreamEvent] = field(default_factory=list)
+    tool_calls_by_index: dict[int, CanonicalToolCall] = field(default_factory=dict)
+    tool_calls_in_order: list[CanonicalToolCall] = field(default_factory=list)
 
 
 def init_anthropic_stream_state(protocol_out: str) -> AnthropicStreamState:
@@ -238,6 +240,23 @@ def process_anthropic_stream_line(
         message = payload.get("message")
         if isinstance(message, dict) and isinstance(message.get("model"), str):
             state.model = message["model"]
+    elif payload.get("type") == "content_block_start":
+        content_block = payload.get("content_block")
+        index = payload.get("index")
+        if (
+            isinstance(index, int)
+            and isinstance(content_block, dict)
+            and content_block.get("type") == "tool_use"
+            and isinstance(content_block.get("id"), str)
+            and isinstance(content_block.get("name"), str)
+        ):
+            tool_call = CanonicalToolCall(
+                id=content_block["id"],
+                name=content_block["name"],
+                arguments="",
+            )
+            state.tool_calls_by_index[index] = tool_call
+            state.tool_calls_in_order.append(tool_call)
     elif payload.get("type") == "content_block_delta":
         delta = payload.get("delta")
         if isinstance(delta, dict) and isinstance(delta.get("text"), str):
@@ -247,6 +266,22 @@ def process_anthropic_stream_line(
             )
             state.events.append(event)
             emitted.append(event)
+        elif (
+            isinstance(delta, dict)
+            and isinstance(delta.get("partial_json"), str)
+            and isinstance(payload.get("index"), int)
+        ):
+            tool_call = state.tool_calls_by_index.get(payload["index"])
+            if tool_call is not None:
+                tool_call.arguments += delta["partial_json"]
+                event = CanonicalStreamEvent(
+                    event_type="function_call_arguments_delta",
+                    response_id=state.response_id,
+                    item_id=tool_call.id,
+                    delta=delta["partial_json"],
+                )
+                state.events.append(event)
+                emitted.append(event)
     elif payload.get("type") == "message_delta":
         usage_payload = payload.get("usage")
         if isinstance(usage_payload, dict):
@@ -271,6 +306,7 @@ def build_anthropic_stream_result(
             CanonicalMessage(
                 role="assistant",
                 content=[CanonicalContentPart(type="text", text="".join(state.text_parts))],
+                tool_calls=state.tool_calls_in_order,
             )
         ],
         usage=state.usage,

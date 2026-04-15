@@ -2743,6 +2743,116 @@ async def test_oairesp_live_bridge_from_oaichat_emits_text_deltas_early(
 
 
 @pytest.mark.asyncio
+async def test_oairesp_live_bridge_from_oaichat_emits_tool_call_deltas(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    async def stream_success() -> AsyncIterator[bytes]:
+        first = json.dumps(
+            {
+                "id": "chat1",
+                "model": "a-model",
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "glob", "arguments": '{"pattern":'},
+                                }
+                            ]
+                        }
+                    }
+                ],
+            }
+        )
+        yield f"data: {first}\n\n".encode()
+        second = json.dumps(
+            {
+                "id": "chat1",
+                "model": "a-model",
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"arguments": '"*.md"}'},
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            }
+        )
+        yield f"data: {second}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=stream_success(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-4.1": "a-model"},
+                }
+            ],
+        }
+    )
+    adapter = OpenAIResponsesAdapter()
+    canonical_request = adapter.parse_request(
+        {"model": "gpt-4.1", "input": "hi", "stream": True},
+        strip_unsupported_fields=True,
+    )
+    generator = await _prepare_live_stream_bridge(
+        inbound_protocol="oairesp",
+        request_id="req-live-oairesp-oaichat-tools",
+        canonical_request=canonical_request,
+        providers=[config.providers[0]],
+        adapter=adapter,
+        runtime=None,
+        api_key=None,
+        store=SQLiteConversationStore(tmp_path / "live-stream-oairesp-oaichat-tools.db"),
+        config=config,
+        started_perf=0.0,
+    )
+
+    chunks = [chunk async for chunk in generator]
+    assert any('"response.function_call_arguments.delta"' in chunk for chunk in chunks)
+    assert any('"name": "glob"' in chunk for chunk in chunks)
+    assert any('"delta": "{\\"pattern\\":"' in chunk for chunk in chunks)
+    assert any('"delta": "\\"*.md\\"}"' in chunk for chunk in chunks)
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+@pytest.mark.asyncio
 async def test_oairesp_live_bridge_from_anthropic_emits_text_deltas_early(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2907,7 +3017,8 @@ async def test_oaichat_live_bridge_from_anthropic_emits_text_deltas_early(
         chunks.append(chunk)
 
     assert second_chunk_released.is_set()
-    assert any('"content": "lo"' in chunk for chunk in chunks)
+    assert sum('"content": "Hel"' in chunk for chunk in chunks) == 1
+    assert sum('"content": "lo"' in chunk for chunk in chunks) == 1
     assert any('"finish_reason": "stop"' in chunk for chunk in chunks)
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
@@ -2990,6 +3101,75 @@ async def test_oaichat_live_bridge_from_oairesp_emits_text_deltas_early(
     assert second_chunk_released.is_set()
     assert any('"content": "lo"' in chunk for chunk in chunks)
     assert any('"finish_reason": "stop"' in chunk for chunk in chunks)
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+@pytest.mark.asyncio
+async def test_oaichat_live_bridge_from_oairesp_emits_tool_call_deltas(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    async def stream_success() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.4"}}\n\n'
+        yield b'data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"fc_1","name":"glob","arguments":"","status":"in_progress"}}\n\n'
+        yield b'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\\"pattern\\":\\"*.md\\"}"}\n\n'
+        yield b'data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=stream_success(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oairesp",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "gpt-5.4"},
+                }
+            ],
+        }
+    )
+    adapter = OpenAIChatAdapter()
+    canonical_request = adapter.parse_request(
+        {"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        strip_unsupported_fields=True,
+    )
+    generator = await _prepare_live_stream_bridge(
+        inbound_protocol="oaichat",
+        request_id="req-live-oaichat-oairesp-tools",
+        canonical_request=canonical_request,
+        providers=[config.providers[0]],
+        adapter=adapter,
+        runtime=None,
+        api_key=None,
+        store=SQLiteConversationStore(tmp_path / "live-stream-oaichat-oairesp-tools.db"),
+        config=config,
+        started_perf=0.0,
+    )
+
+    chunks = [chunk async for chunk in generator]
+    assert any('"tool_calls"' in chunk for chunk in chunks)
+    assert any('"name": "glob"' in chunk for chunk in chunks)
+    assert any('"arguments": "{\\"pattern\\":\\"*.md\\"}"' in chunk for chunk in chunks)
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
@@ -3093,6 +3273,425 @@ async def test_anthropic_live_bridge_from_oaichat_emits_text_deltas_early(
     assert second_chunk_released.is_set()
     assert any('"text": "lo"' in chunk for chunk in chunks)
     assert any("event: message_stop" in chunk for chunk in chunks)
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_live_bridge_from_oaichat_emits_tool_use_deltas(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    async def stream_success() -> AsyncIterator[bytes]:
+        first = json.dumps(
+            {
+                "id": "chat1",
+                "model": "gpt-5.4",
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "glob", "arguments": '{"pattern":'},
+                                }
+                            ]
+                        }
+                    }
+                ],
+            }
+        )
+        yield f"data: {first}\n\n".encode()
+        second = json.dumps(
+            {
+                "id": "chat1",
+                "model": "gpt-5.4",
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"arguments": '"*.md"}'},
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            }
+        )
+        yield f"data: {second}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=stream_success(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "gpt-5.4"},
+                }
+            ],
+        }
+    )
+    adapter = AnthropicAdapter()
+    canonical_request = adapter.parse_request(
+        {
+            "model": "gpt-5.4",
+            "stream": True,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        },
+        strip_unsupported_fields=True,
+    )
+    generator = await _prepare_live_stream_bridge(
+        inbound_protocol="anthropic",
+        request_id="req-live-anthropic-oaichat-tools",
+        canonical_request=canonical_request,
+        providers=[config.providers[0]],
+        adapter=adapter,
+        runtime=None,
+        api_key=None,
+        store=SQLiteConversationStore(tmp_path / "live-stream-anthropic-oaichat-tools.db"),
+        config=config,
+        started_perf=0.0,
+    )
+
+    chunks = [chunk async for chunk in generator]
+    assert any('"type": "tool_use"' in chunk for chunk in chunks)
+    assert any('"name": "glob"' in chunk for chunk in chunks)
+    assert any('"partial_json": "{\\"pattern\\":"' in chunk for chunk in chunks)
+    assert any('"partial_json": "\\"*.md\\"}"' in chunk for chunk in chunks)
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+@pytest.mark.asyncio
+async def test_oaichat_live_bridge_from_anthropic_emits_tool_call_deltas(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("B_KEY", "b")
+
+    import httpx
+
+    async def stream_success() -> AsyncIterator[bytes]:
+        yield b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"gpt-5.4","content":[]}}\n\n'
+        yield b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"glob","input":{}}}\n\n'
+        yield b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"pattern\\":\\"*.md\\"}"}}\n\n'
+        yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+        yield b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":1,"output_tokens":2}}\n\n'
+        yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=stream_success(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "b"},
+            "providers": [
+                {
+                    "name": "b",
+                    "protocol": "anthropic",
+                    "base_url": "https://api.anthropic.com",
+                    "api_key_env": "B_KEY",
+                    "models": {"gpt-5.4": "gpt-5.4"},
+                }
+            ],
+        }
+    )
+    adapter = OpenAIChatAdapter()
+    canonical_request = adapter.parse_request(
+        {"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        strip_unsupported_fields=True,
+    )
+    generator = await _prepare_live_stream_bridge(
+        inbound_protocol="oaichat",
+        request_id="req-live-oaichat-anthropic-tools",
+        canonical_request=canonical_request,
+        providers=[config.providers[0]],
+        adapter=adapter,
+        runtime=None,
+        api_key=None,
+        store=SQLiteConversationStore(tmp_path / "live-stream-oaichat-anthropic-tools.db"),
+        config=config,
+        started_perf=0.0,
+    )
+
+    chunks = [chunk async for chunk in generator]
+    assert any('"tool_calls"' in chunk for chunk in chunks)
+    assert any('"name": "glob"' in chunk for chunk in chunks)
+    assert any('"arguments": "{\\"pattern\\":\\"*.md\\"}"' in chunk for chunk in chunks)
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+@pytest.mark.asyncio
+async def test_oairesp_live_bridge_from_anthropic_emits_tool_call_deltas(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("B_KEY", "b")
+
+    import httpx
+
+    async def stream_success() -> AsyncIterator[bytes]:
+        yield b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"gpt-5.4","content":[]}}\n\n'
+        yield b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"glob","input":{}}}\n\n'
+        yield b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"pattern\\":\\"*.md\\"}"}}\n\n'
+        yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+        yield b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":1,"output_tokens":2}}\n\n'
+        yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=stream_success(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "b"},
+            "providers": [
+                {
+                    "name": "b",
+                    "protocol": "anthropic",
+                    "base_url": "https://api.anthropic.com",
+                    "api_key_env": "B_KEY",
+                    "models": {"gpt-5.4": "gpt-5.4"},
+                }
+            ],
+        }
+    )
+    adapter = OpenAIResponsesAdapter()
+    canonical_request = adapter.parse_request(
+        {"model": "gpt-5.4", "input": "hi", "stream": True},
+        strip_unsupported_fields=True,
+    )
+    generator = await _prepare_live_stream_bridge(
+        inbound_protocol="oairesp",
+        request_id="req-live-oairesp-anthropic-tools",
+        canonical_request=canonical_request,
+        providers=[config.providers[0]],
+        adapter=adapter,
+        runtime=None,
+        api_key=None,
+        store=SQLiteConversationStore(tmp_path / "live-stream-oairesp-anthropic-tools.db"),
+        config=config,
+        started_perf=0.0,
+    )
+
+    chunks = [chunk async for chunk in generator]
+    assert any('"response.function_call_arguments.delta"' in chunk for chunk in chunks)
+    assert any('"name": "glob"' in chunk for chunk in chunks)
+    assert any('"delta": "{\\"pattern\\":\\"*.md\\"}"' in chunk for chunk in chunks)
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_live_bridge_from_oairesp_emits_text_deltas_early(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import threading
+    import httpx
+
+    second_chunk_released = threading.Event()
+
+    async def stream_success() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.4"}}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"Hel"}\n\n'
+        await asyncio.sleep(0.15)
+        yield b'data: {"type":"response.output_text.delta","delta":"lo"}\n\n'
+        yield b'data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}\n\n'
+        yield b"data: [DONE]\n\n"
+        second_chunk_released.set()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=stream_success(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oairesp",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "gpt-5.4"},
+                }
+            ],
+        }
+    )
+    adapter = AnthropicAdapter()
+    canonical_request = adapter.parse_request(
+        {
+            "model": "gpt-5.4",
+            "stream": True,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        },
+        strip_unsupported_fields=True,
+    )
+    generator = await _prepare_live_stream_bridge(
+        inbound_protocol="anthropic",
+        request_id="req-live-anthropic-oairesp",
+        canonical_request=canonical_request,
+        providers=[config.providers[0]],
+        adapter=adapter,
+        runtime=None,
+        api_key=None,
+        store=SQLiteConversationStore(tmp_path / "live-stream-anthropic-oairesp.db"),
+        config=config,
+        started_perf=0.0,
+    )
+
+    first_chunk = await anext(generator)
+    assert "event: message_start" in first_chunk
+    next_chunk = await anext(generator)
+    assert "event: content_block_start" in next_chunk
+    delta_chunk = await anext(generator)
+    assert '"text": "Hel"' in delta_chunk
+    assert not second_chunk_released.is_set()
+
+    chunks = [first_chunk, next_chunk, delta_chunk]
+    async for chunk in generator:
+        chunks.append(chunk)
+
+    assert second_chunk_released.is_set()
+    assert any('"text": "lo"' in chunk for chunk in chunks)
+    assert any("event: message_stop" in chunk for chunk in chunks)
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_live_bridge_from_oairesp_emits_tool_use_deltas(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    async def stream_success() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.4"}}\n\n'
+        yield b'data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"fc_1","name":"glob","arguments":"","status":"in_progress"}}\n\n'
+        yield b'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\\"pattern\\":\\"*.md\\"}"}\n\n'
+        yield b'data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=stream_success(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oairesp",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "gpt-5.4"},
+                }
+            ],
+        }
+    )
+    adapter = AnthropicAdapter()
+    canonical_request = adapter.parse_request(
+        {
+            "model": "gpt-5.4",
+            "stream": True,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        },
+        strip_unsupported_fields=True,
+    )
+    generator = await _prepare_live_stream_bridge(
+        inbound_protocol="anthropic",
+        request_id="req-live-anthropic-oairesp-tools",
+        canonical_request=canonical_request,
+        providers=[config.providers[0]],
+        adapter=adapter,
+        runtime=None,
+        api_key=None,
+        store=SQLiteConversationStore(tmp_path / "live-stream-anthropic-oairesp-tools.db"),
+        config=config,
+        started_perf=0.0,
+    )
+
+    chunks = [chunk async for chunk in generator]
+    assert any('"type": "tool_use"' in chunk for chunk in chunks)
+    assert any('"name": "glob"' in chunk for chunk in chunks)
+    assert any('"partial_json": "{\\"pattern\\":\\"*.md\\"}"' in chunk for chunk in chunks)
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
