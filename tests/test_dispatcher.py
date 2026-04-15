@@ -8,10 +8,6 @@ from llmpxy.dispatcher import AllProvidersFailedError, ProviderDispatcher
 from llmpxy.models import CanonicalContentPart, CanonicalMessage, CanonicalRequest
 
 
-def _reverse_members(members: list[str]) -> None:
-    members.reverse()
-
-
 def _request(protocol_in: ProtocolName = "oairesp", stream: bool = False) -> CanonicalRequest:
     return CanonicalRequest(
         protocol_in=protocol_in,
@@ -86,7 +82,7 @@ def test_group_route_supports_group_model_whitelist() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_switches_provider_after_three_failures(
+async def test_dispatcher_switches_provider_immediately_after_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("A_KEY", "a")
@@ -124,7 +120,7 @@ async def test_dispatcher_switches_provider_after_three_failures(
 
     assert provider.name == "b"
     assert response.model == "claude-3-7-sonnet-latest"
-    assert len([item for item in attempts if "a.example" in item]) == 3
+    assert len([item for item in attempts if "a.example" in item]) == 1
     assert len([item for item in attempts if "api.anthropic.com" in item]) == 1
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
@@ -210,7 +206,8 @@ async def test_dispatcher_load_balances_group_members(monkeypatch: pytest.Monkey
             super().__init__(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
-    monkeypatch.setattr("llmpxy.dispatcher.random.shuffle", _reverse_members)
+    thresholds = iter([1.5, 0.5])
+    monkeypatch.setattr("llmpxy.dispatcher.random.uniform", lambda _start, _end: next(thresholds))
     dispatcher = ProviderDispatcher(config)
 
     response, provider = await dispatcher.dispatch(
@@ -274,7 +271,7 @@ async def test_dispatcher_load_balance_order_stays_fixed_across_retry_rounds(
             super().__init__(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
-    monkeypatch.setattr("llmpxy.dispatcher.random.shuffle", _reverse_members)
+    monkeypatch.setattr("llmpxy.dispatcher.random.uniform", lambda _start, _end: 1.5)
     dispatcher = ProviderDispatcher(config)
 
     with pytest.raises(AllProvidersFailedError):
@@ -315,7 +312,8 @@ def test_dispatcher_load_balances_nested_groups(monkeypatch: pytest.MonkeyPatch)
         }
     )
 
-    monkeypatch.setattr("llmpxy.dispatcher.random.shuffle", _reverse_members)
+    thresholds = iter([1.5, 0.5, 1.5, 0.5])
+    monkeypatch.setattr("llmpxy.dispatcher.random.uniform", lambda _start, _end: next(thresholds))
     dispatcher = ProviderDispatcher(config)
 
     assert [provider.name for provider in dispatcher.resolve_route_provider_order()] == [
@@ -328,6 +326,39 @@ def test_dispatcher_load_balances_nested_groups(monkeypatch: pytest.MonkeyPatch)
         "b",
         "c",
     ]
+
+
+def test_dispatcher_load_balance_penalizes_unhealthy_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "group", "name": "balanced"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                },
+                {
+                    "name": "b",
+                    "protocol": "oaichat",
+                    "base_url": "https://b.example/v1",
+                    "api_key_env": "B_KEY",
+                },
+            ],
+            "provider_groups": [
+                {"name": "balanced", "strategy": "load_balance", "members": ["a", "b"]}
+            ],
+        }
+    )
+
+    dispatcher = ProviderDispatcher(config)
+    dispatcher._states["a"].consecutive_errors = 5
+    monkeypatch.setattr("llmpxy.dispatcher.random.uniform", lambda _start, _end: 0.2)
+
+    assert [provider.name for provider in dispatcher.resolve_route_provider_order()] == ["b", "a"]
 
 
 @pytest.mark.asyncio
@@ -412,7 +443,7 @@ async def test_dispatcher_skips_provider_when_model_whitelist_enabled(
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_does_not_retry_model_not_found_errors(
+async def test_dispatcher_tries_next_provider_for_model_not_found_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("A_KEY", "a")
@@ -443,7 +474,7 @@ async def test_dispatcher_does_not_retry_model_not_found_errors(
     monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
     dispatcher = ProviderDispatcher(_config())
 
-    with pytest.raises(Exception):
+    with pytest.raises(AllProvidersFailedError):
         await dispatcher.dispatch(
             CanonicalRequest(
                 protocol_in="oairesp",
@@ -457,5 +488,10 @@ async def test_dispatcher_does_not_retry_model_not_found_errors(
             request_id="req-6",
         )
 
-    assert len(attempts) == 1
+    assert attempts == [
+        "https://a.example/v1/chat/completions",
+        "https://api.anthropic.com/v1/messages",
+        "https://a.example/v1/chat/completions",
+        "https://api.anthropic.com/v1/messages",
+    ]
     monkeypatch.setattr(httpx, "AsyncClient", original)

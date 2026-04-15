@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -197,6 +198,10 @@ def create_runtime_managed_app(runtime: RuntimeManager) -> FastAPI:
     return app
 
 
+def _all_providers_failed_http_exception() -> HTTPException:
+    return HTTPException(status_code=502, detail="all providers failed")
+
+
 async def _handle_protocol_request(
     request: Request,
     config: AppConfig,
@@ -207,6 +212,7 @@ async def _handle_protocol_request(
     request_id = str(uuid.uuid4())
     started_at = int(time.time())
     started_perf = time.perf_counter()
+    response: CanonicalResponse | None = None
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
@@ -308,10 +314,10 @@ async def _handle_protocol_request(
             exc.status_code,
             exc.response_text,
         )
-        raise HTTPException(status_code=exc.status_code or 502, detail=str(exc)) from exc
+        raise _all_providers_failed_http_exception() from exc
     except AllProvidersFailedError as exc:
         log.exception("all providers failed")
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise _all_providers_failed_http_exception() from exc
 
     formatted = adapter.format_response(response)
     if inbound_protocol == "oairesp":
@@ -522,7 +528,7 @@ async def _handle_protocol_request_with_api_key(
             exc.status_code,
             exc.response_text,
         )
-        raise HTTPException(status_code=exc.status_code or 502, detail=str(exc)) from exc
+        raise _all_providers_failed_http_exception() from exc
     except AllProvidersFailedError as exc:
         latency_ms = int((time.perf_counter() - started_perf) * 1000)
         runtime.current().store.put_request_event(
@@ -551,7 +557,10 @@ async def _handle_protocol_request_with_api_key(
             }
         )
         log.exception("all providers failed")
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise _all_providers_failed_http_exception() from exc
+
+    if response is None:
+        raise RuntimeError("dispatcher returned no response")
 
     formatted = adapter.format_response(response)
     if inbound_protocol == "oairesp":
@@ -564,6 +573,24 @@ async def _handle_protocol_request_with_api_key(
             config.storage.ttl_seconds,
         )
     return JSONResponse(formatted)
+
+
+async def _read_first_stream_line(
+    line_iterator: AsyncIterator[str], provider: ProviderConfig
+) -> str:
+    try:
+        async with asyncio.timeout(provider.timeout_seconds):
+            async for line in line_iterator:
+                if line:
+                    return line
+    except TimeoutError as exc:
+        raise ProviderError(
+            f"Provider {provider.name} timed out waiting for first token",
+            provider_name=provider.name,
+            retryable=True,
+            base_url=provider.base_url,
+        ) from exc
+    return ""
 
 
 def _load_history(
@@ -759,12 +786,7 @@ async def _prepare_live_stream_passthrough(
         try:
             response = await open_stream(client, provider, path, payload)
             line_iterator = response.aiter_lines()
-            first_line = ""
-            async for line in line_iterator:
-                if not line:
-                    continue
-                first_line = line
-                break
+            first_line = await _read_first_stream_line(line_iterator, provider)
             if not first_line:
                 await response.aclose()
                 await client.aclose()
@@ -801,8 +823,8 @@ async def _prepare_live_stream_passthrough(
             await client.aclose()
             raise
     if last_error is not None:
-        raise last_error
-    raise ProviderError("No providers available for live stream", retryable=False)
+        raise AllProvidersFailedError("all providers failed", last_error=last_error)
+    raise AllProvidersFailedError("all providers failed")
 
 
 async def _live_stream_bridge_oaichat_to_oairesp(
@@ -1603,12 +1625,7 @@ async def _prepare_live_stream_bridge(
         try:
             response = await open_stream(client, provider, path, payload)
             line_iterator = response.aiter_lines()
-            first_line = ""
-            async for line in line_iterator:
-                if not line:
-                    continue
-                first_line = line
-                break
+            first_line = await _read_first_stream_line(line_iterator, provider)
             if not first_line:
                 await response.aclose()
                 await client.aclose()
@@ -1756,5 +1773,5 @@ async def _prepare_live_stream_bridge(
             await client.aclose()
             raise
     if last_error is not None:
-        raise last_error
-    raise ProviderError("No providers available for live stream bridge", retryable=False)
+        raise AllProvidersFailedError("all providers failed", last_error=last_error)
+    raise AllProvidersFailedError("all providers failed")

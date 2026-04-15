@@ -4067,8 +4067,92 @@ def test_anthropic_live_stream_returns_http_error_before_response_starts(
         },
     )
 
-    assert response.status_code == 404
-    assert response.json()["detail"] == "Provider b returned HTTP 404"
+    assert response.status_code == 502
+    assert response.json()["detail"] == "all providers failed"
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
+def test_live_stream_first_token_timeout_falls_back_to_next_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+    monkeypatch.setenv("B_KEY", "b")
+
+    import asyncio
+    import httpx
+
+    async def slow_stream() -> AsyncIterator[bytes]:
+        await asyncio.sleep(0.05)
+        yield b'data: {"type":"response.completed","response":{"id":"resp_1","model":"a-model","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n'
+
+    async def fast_stream() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"response.created","response":{"id":"resp_2","model":"b-model"}}\n\n'
+        yield b'data: {"type":"response.completed","response":{"id":"resp_2","model":"b-model","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n'
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "a.example":
+            return httpx.Response(
+                200,
+                content=slow_stream(),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(
+            200,
+            content=fast_stream(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "group", "name": "balanced"},
+            "retry": {"max_rounds": 1},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oairesp",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "timeout_seconds": 0.01,
+                    "models": {"gpt-5.4": "a-model"},
+                },
+                {
+                    "name": "b",
+                    "protocol": "oairesp",
+                    "base_url": "https://b.example/v1",
+                    "api_key_env": "B_KEY",
+                    "timeout_seconds": 0.5,
+                    "models": {"gpt-5.4": "b-model"},
+                },
+            ],
+            "provider_groups": [
+                {"name": "balanced", "strategy": "fallback", "members": ["a", "b"]}
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "first-token-timeout.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={"model": "gpt-5.4", "input": "hi", "stream": True},
+    ) as response:
+        assert response.status_code == 200
+        body = "".join(response.iter_text())
+
+    assert "b-model" in body
+    assert "a-model" not in body
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 

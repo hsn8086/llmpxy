@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 import json
 from urllib.parse import urlparse
@@ -188,7 +189,17 @@ async def stream_lines(
     target_url = _build_target_url(provider, path)
     response = await open_stream(client, provider, path, payload)
     try:
-        async for line in response.aiter_lines():
+        line_iterator = response.aiter_lines()
+        first_line = await _read_first_stream_line(line_iterator, provider, path)
+        if first_line:
+            logger.bind(request_id="-", provider=provider.name, round=0, attempt=0).debug(
+                "upstream stream line host={} path={} line={}",
+                urlparse(target_url).netloc,
+                path,
+                first_line,
+            )
+            yield first_line
+        async for line in line_iterator:
             if line:
                 logger.bind(request_id="-", provider=provider.name, round=0, attempt=0).debug(
                     "upstream stream line host={} path={} line={}",
@@ -199,6 +210,25 @@ async def stream_lines(
                 yield line
     finally:
         await response.aclose()
+
+
+async def _read_first_stream_line(
+    line_iterator: AsyncIterator[str], provider: ProviderConfig, path: str
+) -> str:
+    try:
+        async with asyncio.timeout(provider.timeout_seconds):
+            async for line in line_iterator:
+                if line:
+                    return line
+    except TimeoutError as exc:
+        raise ProviderError(
+            f"Provider {provider.name} timed out waiting for first token",
+            provider_name=provider.name,
+            retryable=True,
+            base_url=provider.base_url,
+            path=path,
+        ) from exc
+    return ""
 
 
 def _is_retryable_status(status_code: int) -> bool:

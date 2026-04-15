@@ -158,8 +158,39 @@ class ProviderDispatcher:
     ) -> list[str]:
         ordered_members = list(group.members)
         if group.strategy == "load_balance" and shuffle_load_balance:
-            random.shuffle(ordered_members)
+            ordered_members = self._weighted_member_order(ordered_members)
         return ordered_members
+
+    def _weighted_member_order(self, members: list[str]) -> list[str]:
+        remaining = list(members)
+        ordered: list[str] = []
+        while remaining:
+            total_weight = sum(self._member_health_weight(member) for member in remaining)
+            threshold = random.uniform(0.0, total_weight)
+            cumulative = 0.0
+            for index, member in enumerate(remaining):
+                cumulative += self._member_health_weight(member)
+                if cumulative >= threshold:
+                    ordered.append(remaining.pop(index))
+                    break
+            else:
+                ordered.append(remaining.pop())
+        return ordered
+
+    def _member_health_weight(self, member: str) -> float:
+        provider = self._provider_map.get(member)
+        if provider is not None:
+            return self._provider_health_weight(provider.name)
+        nested_group = self._group_map[member]
+        nested_members = self._expand_group(nested_group, shuffle_load_balance=False)
+        if not nested_members:
+            return 1.0
+        return sum(self._provider_health_weight(item.name) for item in nested_members) / len(
+            nested_members
+        )
+
+    def _provider_health_weight(self, provider_name: str) -> float:
+        return 1.0 / (1 + self._states[provider_name].consecutive_errors)
 
     def _group_names_for_provider(self, provider_name: str) -> list[str]:
         group_names: list[str] = []
@@ -218,91 +249,76 @@ class ProviderDispatcher:
         adapter = get_adapter(provider.protocol)
         mapped_model = provider.map_model(request.requested_model)
         path, payload = adapter.build_request(request, mapped_model)
-        while state.consecutive_errors < self._config.retry.provider_error_threshold:
-            if self._stats is not None:
-                self._stats.record_provider_attempt(provider.name)
-            log = bind_logger(
-                request_id=request_id,
-                provider=provider.name,
-                round_number=round_number,
-                attempt=state.consecutive_errors + 1,
-            )
-            log.debug(
-                "sending request provider_protocol={} path={} mapped_model={} base_url={} proxy={}",
-                provider.protocol,
-                path,
-                mapped_model,
-                provider.base_url,
-                resolve_proxy(self._config, provider),
-            )
-            log.debug(
-                "request canonical summary={} upstream payload summary={}",
-                sanitize_for_logging(
-                    {
-                        "protocol_in": request.protocol_in,
-                        "requested_model": request.requested_model,
-                        "reasoning": request.reasoning,
-                        "message_count": len(request.messages),
-                        "stream": request.stream,
-                    }
-                ),
-                sanitize_for_logging(
-                    {
-                        "path": path,
-                        "model": payload.get("model"),
-                        "reasoning": payload.get("reasoning"),
-                        "reasoning_effort": payload.get("reasoning_effort"),
-                        "stream": payload.get("stream"),
-                        "tool_choice": payload.get("tool_choice"),
-                    }
-                ),
-            )
-            try:
-                async with create_async_client(self._config, provider) as client:
-                    raw = await post_json(client, provider, path, payload)
-                response = adapter.parse_response(raw, provider.protocol)
-                include = request.metadata.get("_request_include")
-                if isinstance(include, list):
-                    response.metadata["_request_include"] = include
-                reasoning = request.reasoning if isinstance(request.reasoning, dict) else None
-                reasoning_summary = reasoning.get("summary") if reasoning is not None else None
-                if isinstance(reasoning_summary, str):
-                    response.metadata["reasoning_summary"] = reasoning_summary
-                if self._stats is not None:
-                    self._stats.record_provider_success(provider.name)
-            except ProviderError as exc:
-                if self._stats is not None:
-                    self._stats.record_provider_error(provider.name, str(exc))
-                if not exc.retryable:
-                    log.exception(
-                        "fatal provider error status_code={} response_text={} base_url={} path={} proxy={} error_code={}",
-                        exc.status_code,
-                        exc.response_text,
-                        exc.base_url,
-                        exc.path,
-                        exc.proxy,
-                        exc.error_code,
-                    )
-                    raise
-                state.consecutive_errors += 1
-                log.exception(
-                    "retryable provider error status_code={} consecutive_errors={} response_text={} base_url={} path={} proxy={} error_code={}",
-                    exc.status_code,
-                    state.consecutive_errors,
-                    exc.response_text,
-                    exc.base_url,
-                    exc.path,
-                    exc.proxy,
-                    exc.error_code,
-                )
-                continue
-            state.consecutive_errors = 0
-            log.info("provider request succeeded")
-            return response
-        bind_logger(request_id=request_id, provider=provider.name, round_number=round_number).info(
-            "provider reached error threshold, moving to next provider"
+        if self._stats is not None:
+            self._stats.record_provider_attempt(provider.name)
+        log = bind_logger(
+            request_id=request_id,
+            provider=provider.name,
+            round_number=round_number,
+            attempt=1,
         )
-        return None
+        log.debug(
+            "sending request provider_protocol={} path={} mapped_model={} base_url={} proxy={}",
+            provider.protocol,
+            path,
+            mapped_model,
+            provider.base_url,
+            resolve_proxy(self._config, provider),
+        )
+        log.debug(
+            "request canonical summary={} upstream payload summary={}",
+            sanitize_for_logging(
+                {
+                    "protocol_in": request.protocol_in,
+                    "requested_model": request.requested_model,
+                    "reasoning": request.reasoning,
+                    "message_count": len(request.messages),
+                    "stream": request.stream,
+                }
+            ),
+            sanitize_for_logging(
+                {
+                    "path": path,
+                    "model": payload.get("model"),
+                    "reasoning": payload.get("reasoning"),
+                    "reasoning_effort": payload.get("reasoning_effort"),
+                    "stream": payload.get("stream"),
+                    "tool_choice": payload.get("tool_choice"),
+                }
+            ),
+        )
+        try:
+            async with create_async_client(self._config, provider) as client:
+                raw = await post_json(client, provider, path, payload)
+            response = adapter.parse_response(raw, provider.protocol)
+            include = request.metadata.get("_request_include")
+            if isinstance(include, list):
+                response.metadata["_request_include"] = include
+            reasoning = request.reasoning if isinstance(request.reasoning, dict) else None
+            reasoning_summary = reasoning.get("summary") if reasoning is not None else None
+            if isinstance(reasoning_summary, str):
+                response.metadata["reasoning_summary"] = reasoning_summary
+            if self._stats is not None:
+                self._stats.record_provider_success(provider.name)
+        except ProviderError as exc:
+            state.consecutive_errors += 1
+            if self._stats is not None:
+                self._stats.record_provider_error(provider.name, str(exc))
+            log.exception(
+                "provider request failed retryable={} status_code={} consecutive_errors={} response_text={} base_url={} path={} proxy={} error_code={}",
+                exc.retryable,
+                exc.status_code,
+                state.consecutive_errors,
+                exc.response_text,
+                exc.base_url,
+                exc.path,
+                exc.proxy,
+                exc.error_code,
+            )
+            return None
+        state.consecutive_errors = 0
+        log.info("provider request succeeded")
+        return response
 
     async def _try_provider_stream(
         self,
@@ -324,91 +340,76 @@ class ProviderDispatcher:
         adapter = get_adapter(provider.protocol)
         mapped_model = provider.map_model(request.requested_model)
         path, payload = adapter.build_request(request, mapped_model)
-        while state.consecutive_errors < self._config.retry.provider_error_threshold:
-            if self._stats is not None:
-                self._stats.record_provider_attempt(provider.name)
-            log = bind_logger(
-                request_id=request_id,
-                provider=provider.name,
-                round_number=round_number,
-                attempt=state.consecutive_errors + 1,
-            )
-            log.debug(
-                "sending stream request provider_protocol={} path={} mapped_model={} base_url={} proxy={}",
-                provider.protocol,
-                path,
-                mapped_model,
-                provider.base_url,
-                resolve_proxy(self._config, provider),
-            )
-            log.debug(
-                "stream canonical summary={} upstream payload summary={}",
-                sanitize_for_logging(
-                    {
-                        "protocol_in": request.protocol_in,
-                        "requested_model": request.requested_model,
-                        "reasoning": request.reasoning,
-                        "message_count": len(request.messages),
-                        "stream": request.stream,
-                    }
-                ),
-                sanitize_for_logging(
-                    {
-                        "path": path,
-                        "model": payload.get("model"),
-                        "reasoning": payload.get("reasoning"),
-                        "reasoning_effort": payload.get("reasoning_effort"),
-                        "stream": payload.get("stream"),
-                        "tool_choice": payload.get("tool_choice"),
-                    }
-                ),
-            )
-            try:
-                async with create_async_client(self._config, provider) as client:
-                    lines = stream_lines(client, provider, path, payload)
-                    response, events = await adapter.parse_stream(lines, provider.protocol)
-                include = request.metadata.get("_request_include")
-                if isinstance(include, list):
-                    response.metadata["_request_include"] = include
-                reasoning = request.reasoning if isinstance(request.reasoning, dict) else None
-                reasoning_summary = reasoning.get("summary") if reasoning is not None else None
-                if isinstance(reasoning_summary, str):
-                    response.metadata["reasoning_summary"] = reasoning_summary
-                if self._stats is not None:
-                    self._stats.record_provider_success(provider.name)
-            except ProviderError as exc:
-                if self._stats is not None:
-                    self._stats.record_provider_error(provider.name, str(exc))
-                if not exc.retryable:
-                    log.exception(
-                        "fatal provider stream error status_code={} response_text={} base_url={} path={} proxy={} error_code={}",
-                        exc.status_code,
-                        exc.response_text,
-                        exc.base_url,
-                        exc.path,
-                        exc.proxy,
-                        exc.error_code,
-                    )
-                    raise
-                state.consecutive_errors += 1
-                log.exception(
-                    "retryable provider stream error status_code={} consecutive_errors={} response_text={} base_url={} path={} proxy={} error_code={}",
-                    exc.status_code,
-                    state.consecutive_errors,
-                    exc.response_text,
-                    exc.base_url,
-                    exc.path,
-                    exc.proxy,
-                    exc.error_code,
-                )
-                continue
-            state.consecutive_errors = 0
-            log.info("provider stream succeeded")
-            return response, events
-        bind_logger(request_id=request_id, provider=provider.name, round_number=round_number).info(
-            "provider reached error threshold, moving to next provider"
+        if self._stats is not None:
+            self._stats.record_provider_attempt(provider.name)
+        log = bind_logger(
+            request_id=request_id,
+            provider=provider.name,
+            round_number=round_number,
+            attempt=1,
         )
-        return None
+        log.debug(
+            "sending stream request provider_protocol={} path={} mapped_model={} base_url={} proxy={}",
+            provider.protocol,
+            path,
+            mapped_model,
+            provider.base_url,
+            resolve_proxy(self._config, provider),
+        )
+        log.debug(
+            "stream canonical summary={} upstream payload summary={}",
+            sanitize_for_logging(
+                {
+                    "protocol_in": request.protocol_in,
+                    "requested_model": request.requested_model,
+                    "reasoning": request.reasoning,
+                    "message_count": len(request.messages),
+                    "stream": request.stream,
+                }
+            ),
+            sanitize_for_logging(
+                {
+                    "path": path,
+                    "model": payload.get("model"),
+                    "reasoning": payload.get("reasoning"),
+                    "reasoning_effort": payload.get("reasoning_effort"),
+                    "stream": payload.get("stream"),
+                    "tool_choice": payload.get("tool_choice"),
+                }
+            ),
+        )
+        try:
+            async with create_async_client(self._config, provider) as client:
+                lines = stream_lines(client, provider, path, payload)
+                response, events = await adapter.parse_stream(lines, provider.protocol)
+            include = request.metadata.get("_request_include")
+            if isinstance(include, list):
+                response.metadata["_request_include"] = include
+            reasoning = request.reasoning if isinstance(request.reasoning, dict) else None
+            reasoning_summary = reasoning.get("summary") if reasoning is not None else None
+            if isinstance(reasoning_summary, str):
+                response.metadata["reasoning_summary"] = reasoning_summary
+            if self._stats is not None:
+                self._stats.record_provider_success(provider.name)
+        except ProviderError as exc:
+            state.consecutive_errors += 1
+            if self._stats is not None:
+                self._stats.record_provider_error(provider.name, str(exc))
+            log.exception(
+                "provider stream failed retryable={} status_code={} consecutive_errors={} response_text={} base_url={} path={} proxy={} error_code={}",
+                exc.retryable,
+                exc.status_code,
+                state.consecutive_errors,
+                exc.response_text,
+                exc.base_url,
+                exc.path,
+                exc.proxy,
+                exc.error_code,
+            )
+            return None
+        state.consecutive_errors = 0
+        log.info("provider stream succeeded")
+        return response, events
 
     async def _backoff_if_needed(self, round_number: int, request_id: str) -> None:
         if round_number >= self._config.retry.max_rounds:
