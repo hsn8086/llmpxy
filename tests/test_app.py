@@ -81,6 +81,30 @@ def _assert_normalized_question_schema(schema: dict[str, Any]) -> None:
     assert items_schema["required"] == ["header", "multiple"]
 
 
+def test_root_and_v1_return_base_url_hint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+    monkeypatch.setenv("B_KEY", "b")
+
+    config = _config()
+    store = SQLiteConversationStore(tmp_path / "hint-page.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    expected = (
+        "Oops! 这是base_url, 无法用浏览器访问哦, 如果你不知道怎么做的话..."
+        "让codex/claude code教你吧!"
+    )
+
+    root_response = client.get("/")
+    v1_response = client.get("/v1")
+
+    assert root_response.status_code == 200
+    assert root_response.text == expected
+    assert v1_response.status_code == 200
+    assert v1_response.text == expected
+
+
 @pytest.mark.asyncio
 async def test_oairesp_previous_response_id(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

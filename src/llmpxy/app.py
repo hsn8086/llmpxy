@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.responses import Response
 
 from llmpxy.auth import AuthenticatedApiKey
@@ -50,10 +50,20 @@ from llmpxy.protocols.oai_responses import (
 from llmpxy.storage import ConversationStore
 
 
+_BASE_URL_HINT = (
+    "Oops! 这是base_url, 无法用浏览器访问哦, 如果你不知道怎么做的话...让codex/claude code教你吧!"
+)
+
+
 def create_app(
     config: AppConfig, store: ConversationStore, dispatcher: ProviderDispatcher
 ) -> FastAPI:
     app = FastAPI(title="llmpxy")
+
+    @app.get("/")
+    @app.get("/v1")
+    async def index() -> PlainTextResponse:
+        return PlainTextResponse(_BASE_URL_HINT)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -127,6 +137,11 @@ def create_app(
 def create_runtime_managed_app(runtime: RuntimeManager) -> FastAPI:
     app = FastAPI(title="llmpxy")
     app.include_router(create_admin_router(runtime, runtime.current().config_path))
+
+    @app.get("/")
+    @app.get("/v1")
+    async def index() -> PlainTextResponse:
+        return PlainTextResponse(_BASE_URL_HINT)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
