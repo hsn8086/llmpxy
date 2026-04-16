@@ -261,7 +261,9 @@ async def _handle_protocol_request(
 
     try:
         if canonical_request.stream:
-            route_providers = dispatcher.resolve_route_provider_order()
+            route_providers = _prioritize_protocol_compatible_providers(
+                inbound_protocol, dispatcher.resolve_route_provider_order()
+            )
             if _can_bridge_live_stream(inbound_protocol, route_providers):
                 return StreamingResponse(
                     await _prepare_live_stream_bridge(
@@ -299,7 +301,9 @@ async def _handle_protocol_request(
                     headers=_stream_headers(),
                 )
             response, events, provider = await dispatcher.dispatch_stream(
-                canonical_request, request_id=request_id
+                canonical_request,
+                request_id=request_id,
+                providers=route_providers,
             )
             if inbound_protocol == "oairesp":
                 _save_conversation(
@@ -322,7 +326,13 @@ async def _handle_protocol_request(
                 headers=_stream_headers(),
             )
 
-        response, provider = await dispatcher.dispatch(canonical_request, request_id=request_id)
+        response, provider = await dispatcher.dispatch(
+            canonical_request,
+            request_id=request_id,
+            providers=_prioritize_protocol_compatible_providers(
+                inbound_protocol, dispatcher.resolve_route_provider_order()
+            ),
+        )
     except ProviderError as exc:
         log.exception(
             "provider fatal error status_code={} response_text={}",
@@ -411,14 +421,17 @@ async def _handle_protocol_request_with_api_key(
     canonical_request.messages = merged_messages
 
     try:
+        prioritized_providers = _prioritize_protocol_compatible_providers(
+            inbound_protocol, selectable_providers
+        )
         if canonical_request.stream:
-            if _can_bridge_live_stream(inbound_protocol, selectable_providers):
+            if _can_bridge_live_stream(inbound_protocol, prioritized_providers):
                 return StreamingResponse(
                     await _prepare_live_stream_bridge(
                         inbound_protocol=inbound_protocol,
                         request_id=request_id,
                         canonical_request=canonical_request,
-                        providers=selectable_providers,
+                        providers=prioritized_providers,
                         adapter=adapter,
                         runtime=runtime,
                         api_key=api_key,
@@ -430,13 +443,13 @@ async def _handle_protocol_request_with_api_key(
                     media_type=_stream_media_type(inbound_protocol),
                     headers=_stream_headers(),
                 )
-            if _can_passthrough_live_stream(inbound_protocol, selectable_providers):
+            if _can_passthrough_live_stream(inbound_protocol, prioritized_providers):
                 return StreamingResponse(
                     await _prepare_live_stream_passthrough(
                         inbound_protocol=inbound_protocol,
                         request_id=request_id,
                         canonical_request=canonical_request,
-                        providers=selectable_providers,
+                        providers=prioritized_providers,
                         adapter=adapter,
                         runtime=runtime,
                         api_key=api_key,
@@ -451,7 +464,7 @@ async def _handle_protocol_request_with_api_key(
             response, events, provider = await dispatcher.dispatch_stream(
                 canonical_request,
                 request_id=request_id,
-                providers=selectable_providers,
+                providers=prioritized_providers,
             )
             if inbound_protocol == "oairesp":
                 _save_conversation(
@@ -489,7 +502,7 @@ async def _handle_protocol_request_with_api_key(
         response, provider = await dispatcher.dispatch(
             canonical_request,
             request_id=request_id,
-            providers=selectable_providers,
+            providers=prioritized_providers,
         )
         runtime.record_usage(
             api_key=api_key,
@@ -707,6 +720,29 @@ def _can_bridge_live_stream(
     if inbound_protocol == "anthropic":
         return providers[0].protocol in {"oaichat", "oairesp"}
     return False
+
+
+def _provider_protocol_priority(
+    inbound_protocol: ProtocolName, provider_protocol: ProtocolName
+) -> int:
+    if provider_protocol == inbound_protocol:
+        return 0
+    if inbound_protocol == "oairesp" and provider_protocol in {"oaichat", "anthropic"}:
+        return 1
+    if inbound_protocol == "oaichat" and provider_protocol in {"anthropic", "oairesp"}:
+        return 1
+    if inbound_protocol == "anthropic" and provider_protocol in {"oaichat", "oairesp"}:
+        return 1
+    return 2
+
+
+def _prioritize_protocol_compatible_providers(
+    inbound_protocol: ProtocolName, providers: list[ProviderConfig]
+) -> list[ProviderConfig]:
+    return sorted(
+        providers,
+        key=lambda provider: _provider_protocol_priority(inbound_protocol, provider.protocol),
+    )
 
 
 async def _live_stream_passthrough(

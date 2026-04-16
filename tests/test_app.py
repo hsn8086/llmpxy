@@ -105,6 +105,79 @@ def test_root_and_v1_return_base_url_hint(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert v1_response.text == expected
 
 
+def test_oairesp_stream_prefers_native_protocol_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+    monkeypatch.setenv("B_KEY", "b")
+
+    import httpx
+
+    attempts: list[str] = []
+
+    async def stream_success() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.4"}}\n\n'
+        yield b'data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n'
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(str(request.url))
+        if request.url.host == "a.example":
+            return httpx.Response(400, json={"error": {"message": "unsupported model"}})
+        return httpx.Response(
+            200,
+            content=stream_success(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "group", "name": "default"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "a-model"},
+                },
+                {
+                    "name": "b",
+                    "protocol": "oairesp",
+                    "base_url": "https://b.example/v1",
+                    "api_key_env": "B_KEY",
+                    "models": {"gpt-5.4": "gpt-5.4"},
+                },
+            ],
+            "provider_groups": [
+                {"name": "default", "strategy": "load_balance", "members": ["a", "b"]}
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "protocol-priority.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={"model": "gpt-5.4", "input": "hi", "stream": True},
+    ) as response:
+        assert response.status_code == 200
+        assert "response.completed" in "".join(response.iter_text())
+
+    assert attempts == ["https://b.example/v1/responses"]
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
 @pytest.mark.asyncio
 async def test_oairesp_previous_response_id(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
