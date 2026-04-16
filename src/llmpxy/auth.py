@@ -38,12 +38,16 @@ class ApiKeyRegistry:
             group_limits_usd=dict(api_key.group_limits_usd),
         )
 
-    def authenticate(self, authorization: str | None) -> AuthenticatedApiKey:
+    def authenticate(
+        self, authorization: str | None, x_api_key: str | None = None
+    ) -> AuthenticatedApiKey:
         if not self._api_keys_by_value:
             raise HTTPException(status_code=503, detail="No inbound API keys configured")
         token = _extract_bearer_token(authorization)
+        if token is None and isinstance(x_api_key, str):
+            token = x_api_key.strip() or None
         if token is None:
-            raise HTTPException(status_code=401, detail="Missing Authorization bearer token")
+            raise HTTPException(status_code=401, detail="Missing API key")
         api_key = self._api_keys_by_value.get(token)
         if api_key is None:
             raise HTTPException(status_code=401, detail="Invalid API key")

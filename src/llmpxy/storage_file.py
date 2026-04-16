@@ -18,7 +18,8 @@ class FileConversationStore:
         self._events_directory.mkdir(parents=True, exist_ok=True)
 
     def _path_for(self, response_id: str) -> Path:
-        return self._directory / f"{response_id}.json"
+        safe_id = _sanitize_storage_id(response_id)
+        return self._directory / f"{safe_id}.json"
 
     def get(self, response_id: str) -> StoredConversation | None:
         self.delete_expired()
@@ -66,12 +67,12 @@ class FileConversationStore:
         return total_cost
 
     def put_api_key_usage(self, record: ApiKeyUsageRecord) -> None:
-        path = self._usage_directory / f"{record.request_id}.json"
+        path = self._usage_directory / f"{_sanitize_storage_id(record.request_id)}.json"
         with path.open("w", encoding="utf-8") as handle:
             json.dump(record.model_dump(mode="json"), handle, ensure_ascii=True)
 
     def put_request_event(self, record: RequestEventRecord) -> None:
-        path = self._events_directory / f"{record.request_id}.json"
+        path = self._events_directory / f"{_sanitize_storage_id(record.request_id)}.json"
         with path.open("w", encoding="utf-8") as handle:
             json.dump(record.model_dump(mode="json"), handle, ensure_ascii=True)
 
@@ -99,3 +100,16 @@ class FileConversationStore:
         if limit is None:
             return records
         return records[:limit]
+
+
+def _sanitize_storage_id(value: str) -> str:
+    if not value:
+        raise ValueError("storage id must not be empty")
+    if any(
+        char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+        for char in value
+    ):
+        raise ValueError("storage id contains unsafe characters")
+    if value in {".", ".."} or "/" in value or "\\" in value:
+        raise ValueError("storage id contains unsafe path segments")
+    return value

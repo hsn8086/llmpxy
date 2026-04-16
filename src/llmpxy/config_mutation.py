@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import secrets
+import threading
 import uuid
 from pathlib import Path
 from typing import Any
@@ -8,6 +10,9 @@ from typing import Any
 import tomlkit
 
 from llmpxy.config import AppConfig, load_config
+
+
+_CONFIG_WRITE_LOCK = threading.RLock()
 
 
 def update_admin_config(config_path: Path, patch: dict[str, Any]) -> AppConfig:
@@ -128,14 +133,16 @@ def _load_document(config_path: Path):
 
 
 def _write_and_validate(config_path: Path, document: Any) -> AppConfig:
-    original = config_path.read_text(encoding="utf-8")
     rendered = tomlkit.dumps(document)
-    config_path.write_text(rendered, encoding="utf-8")
-    try:
-        return load_config(config_path)
-    except Exception:
-        config_path.write_text(original, encoding="utf-8")
-        raise
+    temp_path = config_path.with_name(f".{config_path.name}.{uuid.uuid4().hex}.tmp")
+    with _CONFIG_WRITE_LOCK:
+        temp_path.write_text(rendered, encoding="utf-8")
+        try:
+            config = load_config(temp_path)
+            os.replace(temp_path, config_path)
+            return config
+        finally:
+            temp_path.unlink(missing_ok=True)
 
 
 def _mask_secret(value: str) -> str:

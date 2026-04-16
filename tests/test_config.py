@@ -3,8 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import tomlkit
 
 from llmpxy.config import AppConfig, load_config
+from llmpxy.config_mutation import update_admin_config
 
 
 def test_load_multi_protocol_config(tmp_path: Path) -> None:
@@ -258,6 +260,30 @@ def test_provider_pricing_rejects_negative_cached_input_price() -> None:
                 ],
             }
         )
+
+
+def test_update_admin_config_is_atomic_on_validation_failure(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    original = """
+[admin]
+enabled = false
+
+[route]
+type = "provider"
+name = "openai-a"
+
+[[providers]]
+name = "openai-a"
+protocol = "oaichat"
+base_url = "https://a.example/v1"
+api_key_env = "A_KEY"
+"""
+    config_file.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        update_admin_config(config_file, {"enabled": True})
+
+    assert config_file.read_text(encoding="utf-8") == original
 
 
 def test_api_key_uuid_must_be_unique() -> None:

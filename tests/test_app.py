@@ -105,6 +105,25 @@ def test_root_and_v1_return_base_url_hint(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert v1_response.text == expected
 
 
+def test_invalid_json_returns_400(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+    monkeypatch.setenv("B_KEY", "b")
+
+    config = _config()
+    store = SQLiteConversationStore(tmp_path / "invalid-json.db")
+    dispatcher = ProviderDispatcher(config)
+    client = TestClient(create_app(config, store, dispatcher))
+
+    response = client.post(
+        "/v1/chat/completions",
+        content="{invalid",
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Request body must be valid JSON"
+
+
 def test_oairesp_stream_prefers_native_protocol_provider(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

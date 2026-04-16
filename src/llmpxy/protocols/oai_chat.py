@@ -445,7 +445,10 @@ def _message_to_oaichat(message: CanonicalMessage) -> dict[str, Any]:
             {
                 "id": tool_call.id,
                 "type": tool_call.type,
-                "function": {"name": tool_call.name, "arguments": tool_call.arguments},
+                "function": {
+                    "name": tool_call.name or "tool",
+                    "arguments": tool_call.arguments,
+                },
             }
             for tool_call in message.tool_calls
         ]

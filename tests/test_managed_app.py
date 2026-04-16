@@ -92,6 +92,71 @@ def test_managed_app_requires_api_key_and_enforces_budget(tmp_path: Path, monkey
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
+def test_managed_app_accepts_anthropic_x_api_key_header(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("UPSTREAM_A_KEY", "upstream-a")
+
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[admin]
+enabled = true
+token = "admin-token"
+
+[route]
+type = "provider"
+name = "provider-a"
+
+[[api_keys]]
+uuid = "11111111-1111-1111-1111-111111111111"
+name = "client-a"
+key = "client-a"
+limit_usd = 10.0
+
+[[providers]]
+name = "provider-a"
+protocol = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "UPSTREAM_A_KEY"
+
+[providers.pricing.default]
+input_per_million_tokens_usd = 1.0
+output_per_million_tokens_usd = 1.0
+""",
+        encoding="utf-8",
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "model": "provider-model",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    runtime = RuntimeManager(config_file)
+    client = TestClient(create_runtime_managed_app(runtime))
+
+    response = client.post(
+        "/v1/messages",
+        headers={"x-api-key": "client-a", "anthropic-version": "2023-06-01"},
+        json={"model": "gpt-4.1", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
 def test_managed_app_admin_endpoints_require_admin_token(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("UPSTREAM_A_KEY", "upstream-a")
     config_file = tmp_path / "config.toml"
@@ -174,9 +239,6 @@ members = ["provider-a", "provider-b"]
             },
         )
 
-    def reverse_members(members: list[str]) -> None:
-        members.reverse()
-
     original = httpx.AsyncClient
 
     class PatchedAsyncClient(httpx.AsyncClient):
@@ -185,7 +247,7 @@ members = ["provider-a", "provider-b"]
             super().__init__(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
-    monkeypatch.setattr("llmpxy.dispatcher.random.shuffle", reverse_members)
+    monkeypatch.setattr("llmpxy.dispatcher.random.uniform", lambda _start, _end: 1.5)
 
     runtime = RuntimeManager(config_file)
     client = TestClient(create_runtime_managed_app(runtime))

@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import pytest
+
 from llmpxy.models import ApiKeyUsageRecord, RequestEventRecord, StoredConversation
 from llmpxy.storage_file import FileConversationStore
 from llmpxy.storage_sqlite import SQLiteConversationStore
@@ -39,6 +41,16 @@ def test_file_store_roundtrip(tmp_path: Path) -> None:
     loaded = store.get("resp_2")
     assert loaded is not None
     assert loaded.response_id == "resp_2"
+
+
+def test_file_store_rejects_unsafe_response_id(tmp_path: Path) -> None:
+    store = FileConversationStore(tmp_path / "conversations")
+
+    with pytest.raises(ValueError):
+        store.put(_conversation("../escape"))
+
+    with pytest.raises(ValueError):
+        store.get("../escape")
 
 
 def test_expired_file_store_entry_deleted(tmp_path: Path) -> None:

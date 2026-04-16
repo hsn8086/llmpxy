@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 from collections.abc import AsyncIterator
+from json import JSONDecodeError
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -228,7 +229,7 @@ async def _handle_protocol_request(
     started_at = int(time.time())
     started_perf = time.perf_counter()
     response: CanonicalResponse | None = None
-    payload = await request.json()
+    payload = await _parse_json_payload(request)
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
 
@@ -370,7 +371,9 @@ async def _handle_runtime_protocol_request(
     inbound_protocol: ProtocolName,
 ) -> Response:
     state = runtime.current()
-    api_key = runtime.authenticate(request.headers.get("Authorization"))
+    api_key = runtime.authenticate(
+        request.headers.get("Authorization"), request.headers.get("x-api-key")
+    )
     provider_order = state.dispatcher.resolve_route_provider_order()
     selectable_providers = runtime.selectable_provider_configs(api_key, provider_order)
     if not selectable_providers:
@@ -402,7 +405,7 @@ async def _handle_protocol_request_with_api_key(
     request_id = str(uuid.uuid4())
     started_at = int(time.time())
     started_perf = time.perf_counter()
-    payload = await request.json()
+    payload = await _parse_json_payload(request)
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
 
@@ -466,24 +469,25 @@ async def _handle_protocol_request_with_api_key(
                 request_id=request_id,
                 providers=prioritized_providers,
             )
-            if inbound_protocol == "oairesp":
-                _save_conversation(
-                    store,
-                    adapter.format_response(response),
-                    response.model,
-                    response.output_messages,
-                    canonical_request.metadata,
-                    config.storage.ttl_seconds,
+            with runtime.budget_guard(api_key, provider.name):
+                if inbound_protocol == "oairesp":
+                    _save_conversation(
+                        store,
+                        adapter.format_response(response),
+                        response.model,
+                        response.output_messages,
+                        canonical_request.metadata,
+                        config.storage.ttl_seconds,
+                    )
+                runtime.record_usage(
+                    api_key=api_key,
+                    request_id=request_id,
+                    started_at=started_at,
+                    request=canonical_request,
+                    response=response,
+                    provider_name=provider.name,
+                    latency_ms=int((time.perf_counter() - started_perf) * 1000),
                 )
-            runtime.record_usage(
-                api_key=api_key,
-                request_id=request_id,
-                started_at=started_at,
-                request=canonical_request,
-                response=response,
-                provider_name=provider.name,
-                latency_ms=int((time.perf_counter() - started_perf) * 1000),
-            )
             await runtime.publish_request_event(
                 {
                     "request_id": request_id,
@@ -504,15 +508,16 @@ async def _handle_protocol_request_with_api_key(
             request_id=request_id,
             providers=prioritized_providers,
         )
-        runtime.record_usage(
-            api_key=api_key,
-            request_id=request_id,
-            started_at=started_at,
-            request=canonical_request,
-            response=response,
-            provider_name=provider.name,
-            latency_ms=int((time.perf_counter() - started_perf) * 1000),
-        )
+        with runtime.budget_guard(api_key, provider.name):
+            runtime.record_usage(
+                api_key=api_key,
+                request_id=request_id,
+                started_at=started_at,
+                request=canonical_request,
+                response=response,
+                provider_name=provider.name,
+                latency_ms=int((time.perf_counter() - started_perf) * 1000),
+            )
         await runtime.publish_request_event(
             {
                 "request_id": request_id,
@@ -601,6 +606,13 @@ async def _handle_protocol_request_with_api_key(
             config.storage.ttl_seconds,
         )
     return JSONResponse(formatted)
+
+
+async def _parse_json_payload(request: Request) -> Any:
+    try:
+        return await request.json()
+    except JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON") from exc
 
 
 async def _read_first_stream_line(
@@ -890,6 +902,7 @@ async def _live_stream_bridge_oaichat_to_oairesp(
     config: AppConfig,
     started_at: int,
     started_perf: float,
+    request_lock: Any,
     first_line: str,
     client: Any,
     response: Any,
@@ -965,6 +978,7 @@ async def _live_stream_bridge_oaichat_to_oairesp(
         canonical_request.metadata,
         config.storage.ttl_seconds,
     )
+    _release_request_lock(request_lock)
 
 
 async def _live_stream_bridge_anthropic_to_oairesp(
@@ -979,6 +993,7 @@ async def _live_stream_bridge_anthropic_to_oairesp(
     config: AppConfig,
     started_at: int,
     started_perf: float,
+    request_lock: Any,
     first_line: str,
     client: Any,
     response: Any,
@@ -1048,6 +1063,7 @@ async def _live_stream_bridge_anthropic_to_oairesp(
         canonical_request.metadata,
         config.storage.ttl_seconds,
     )
+    _release_request_lock(request_lock)
 
 
 async def _live_stream_bridge_anthropic_to_oaichat(
@@ -1062,6 +1078,7 @@ async def _live_stream_bridge_anthropic_to_oaichat(
     config: AppConfig,
     started_at: int,
     started_perf: float,
+    request_lock: Any,
     first_line: str,
     client: Any,
     response: Any,
@@ -1112,7 +1129,9 @@ async def _live_stream_bridge_anthropic_to_oaichat(
                                         "id": event.item_id,
                                         "type": "function",
                                         "function": {
-                                            "name": tool_call.name if tool_call is not None else "",
+                                            "name": _safe_tool_name(
+                                                tool_call.name if tool_call is not None else None
+                                            ),
                                             "arguments": event.delta,
                                         },
                                     }
@@ -1169,9 +1188,11 @@ async def _live_stream_bridge_anthropic_to_oaichat(
                                             "id": event.item_id,
                                             "type": "function",
                                             "function": {
-                                                "name": tool_call.name
-                                                if tool_call is not None
-                                                else "",
+                                                "name": _safe_tool_name(
+                                                    tool_call.name
+                                                    if tool_call is not None
+                                                    else None
+                                                ),
                                                 "arguments": event.delta,
                                             },
                                         }
@@ -1222,6 +1243,7 @@ async def _live_stream_bridge_anthropic_to_oaichat(
                 "status": "success",
             }
         )
+    _release_request_lock(request_lock)
 
 
 async def _live_stream_bridge_oairesp_to_oaichat(
@@ -1236,6 +1258,7 @@ async def _live_stream_bridge_oairesp_to_oaichat(
     config: AppConfig,
     started_at: int,
     started_perf: float,
+    request_lock: Any,
     first_line: str,
     client: Any,
     response: Any,
@@ -1288,7 +1311,9 @@ async def _live_stream_bridge_oairesp_to_oaichat(
                                         "id": event.item_id,
                                         "type": "function",
                                         "function": {
-                                            "name": tool_call.name if tool_call is not None else "",
+                                            "name": _safe_tool_name(
+                                                tool_call.name if tool_call is not None else None
+                                            ),
                                             "arguments": event.delta,
                                         },
                                     }
@@ -1347,9 +1372,11 @@ async def _live_stream_bridge_oairesp_to_oaichat(
                                             "id": event.item_id,
                                             "type": "function",
                                             "function": {
-                                                "name": tool_call.name
-                                                if tool_call is not None
-                                                else "",
+                                                "name": _safe_tool_name(
+                                                    tool_call.name
+                                                    if tool_call is not None
+                                                    else None
+                                                ),
                                                 "arguments": event.delta,
                                             },
                                         }
@@ -1400,6 +1427,7 @@ async def _live_stream_bridge_oairesp_to_oaichat(
                 "status": "success",
             }
         )
+    _release_request_lock(request_lock)
 
 
 async def _live_stream_bridge_oaichat_to_anthropic(
@@ -1414,6 +1442,7 @@ async def _live_stream_bridge_oaichat_to_anthropic(
     config: AppConfig,
     started_at: int,
     started_perf: float,
+    request_lock: Any,
     first_line: str,
     client: Any,
     response: Any,
@@ -1456,7 +1485,7 @@ async def _live_stream_bridge_oaichat_to_anthropic(
                     )
                     yield (
                         "event: content_block_start\n"
-                        f"data: {json.dumps({'type': 'content_block_start', 'index': tool_indices[event.item_id], 'content_block': {'type': 'tool_use', 'id': event.item_id, 'name': tool_call.name if tool_call is not None else '', 'input': {}}})}\n\n"
+                        f"data: {json.dumps({'type': 'content_block_start', 'index': tool_indices[event.item_id], 'content_block': {'type': 'tool_use', 'id': event.item_id, 'name': _safe_tool_name(tool_call.name if tool_call is not None else None), 'input': {}}})}\n\n"
                     )
                 yield (
                     "event: content_block_delta\n"
@@ -1485,7 +1514,7 @@ async def _live_stream_bridge_oaichat_to_anthropic(
                         )
                         yield (
                             "event: content_block_start\n"
-                            f"data: {json.dumps({'type': 'content_block_start', 'index': tool_indices[event.item_id], 'content_block': {'type': 'tool_use', 'id': event.item_id, 'name': tool_call.name if tool_call is not None else '', 'input': {}}})}\n\n"
+                            f"data: {json.dumps({'type': 'content_block_start', 'index': tool_indices[event.item_id], 'content_block': {'type': 'tool_use', 'id': event.item_id, 'name': _safe_tool_name(tool_call.name if tool_call is not None else None), 'input': {}}})}\n\n"
                         )
                     yield (
                         "event: content_block_delta\n"
@@ -1524,6 +1553,7 @@ async def _live_stream_bridge_oaichat_to_anthropic(
                 "status": "success",
             }
         )
+    _release_request_lock(request_lock)
 
 
 async def _live_stream_bridge_oairesp_to_anthropic(
@@ -1538,6 +1568,7 @@ async def _live_stream_bridge_oairesp_to_anthropic(
     config: AppConfig,
     started_at: int,
     started_perf: float,
+    request_lock: Any,
     first_line: str,
     client: Any,
     response: Any,
@@ -1577,7 +1608,7 @@ async def _live_stream_bridge_oairesp_to_anthropic(
                     )
                     yield (
                         "event: content_block_start\n"
-                        f"data: {json.dumps({'type': 'content_block_start', 'index': tool_indices[event.item_id], 'content_block': {'type': 'tool_use', 'id': event.item_id, 'name': tool_call.name if tool_call is not None else '', 'input': {}}})}\n\n"
+                        f"data: {json.dumps({'type': 'content_block_start', 'index': tool_indices[event.item_id], 'content_block': {'type': 'tool_use', 'id': event.item_id, 'name': _safe_tool_name(tool_call.name if tool_call is not None else None), 'input': {}}})}\n\n"
                     )
                 yield (
                     "event: content_block_delta\n"
@@ -1611,7 +1642,7 @@ async def _live_stream_bridge_oairesp_to_anthropic(
                         )
                         yield (
                             "event: content_block_start\n"
-                            f"data: {json.dumps({'type': 'content_block_start', 'index': tool_indices[event.item_id], 'content_block': {'type': 'tool_use', 'id': event.item_id, 'name': tool_call.name if tool_call is not None else '', 'input': {}}})}\n\n"
+                            f"data: {json.dumps({'type': 'content_block_start', 'index': tool_indices[event.item_id], 'content_block': {'type': 'tool_use', 'id': event.item_id, 'name': _safe_tool_name(tool_call.name if tool_call is not None else None), 'input': {}}})}\n\n"
                         )
                     yield (
                         "event: content_block_delta\n"
@@ -1650,6 +1681,7 @@ async def _live_stream_bridge_oairesp_to_anthropic(
                 "status": "success",
             }
         )
+    _release_request_lock(request_lock)
 
 
 async def _prepare_live_stream_bridge(
@@ -1665,6 +1697,7 @@ async def _prepare_live_stream_bridge(
     config: AppConfig,
     started_at: int,
     started_perf: float,
+    request_lock: Any = None,
 ) -> AsyncIterator[str]:
     last_error: ProviderError | None = None
     for provider in providers:
@@ -1699,6 +1732,7 @@ async def _prepare_live_stream_bridge(
                     config=config,
                     started_at=started_at,
                     started_perf=started_perf,
+                    request_lock=request_lock,
                     first_line=first_line,
                     client=client,
                     response=response,
@@ -1716,6 +1750,7 @@ async def _prepare_live_stream_bridge(
                     config=config,
                     started_at=started_at,
                     started_perf=started_perf,
+                    request_lock=request_lock,
                     first_line=first_line,
                     client=client,
                     response=response,
@@ -1733,6 +1768,7 @@ async def _prepare_live_stream_bridge(
                     config=config,
                     started_at=started_at,
                     started_perf=started_perf,
+                    request_lock=request_lock,
                     first_line=first_line,
                     client=client,
                     response=response,
@@ -1750,6 +1786,7 @@ async def _prepare_live_stream_bridge(
                     config=config,
                     started_at=started_at,
                     started_perf=started_perf,
+                    request_lock=request_lock,
                     first_line=first_line,
                     client=client,
                     response=response,
@@ -1767,6 +1804,7 @@ async def _prepare_live_stream_bridge(
                     config=config,
                     started_at=started_at,
                     started_perf=started_perf,
+                    request_lock=request_lock,
                     first_line=first_line,
                     client=client,
                     response=response,
@@ -1784,23 +1822,7 @@ async def _prepare_live_stream_bridge(
                     config=config,
                     started_at=started_at,
                     started_perf=started_perf,
-                    first_line=first_line,
-                    client=client,
-                    response=response,
-                    line_iterator=line_iterator,
-                )
-            if inbound_protocol == "anthropic" and provider.protocol == "oairesp":
-                return _live_stream_bridge_oairesp_to_anthropic(
-                    request_id=request_id,
-                    canonical_request=canonical_request,
-                    provider=provider,
-                    adapter=adapter,
-                    runtime=runtime,
-                    api_key=api_key,
-                    store=store,
-                    config=config,
-                    started_at=started_at,
-                    started_perf=started_perf,
+                    request_lock=request_lock,
                     first_line=first_line,
                     client=client,
                     response=response,
@@ -1822,7 +1844,24 @@ async def _prepare_live_stream_bridge(
             continue
         except Exception:
             await client.aclose()
+            _release_request_lock(request_lock)
             raise
     if last_error is not None:
+        _release_request_lock(request_lock)
         raise AllProvidersFailedError("all providers failed", last_error=last_error)
+    _release_request_lock(request_lock)
     raise AllProvidersFailedError("all providers failed")
+
+
+def _safe_tool_name(name: str | None) -> str:
+    if isinstance(name, str) and name:
+        return name
+    return "tool"
+
+
+def _release_request_lock(request_lock: Any) -> None:
+    if request_lock is None:
+        return
+    release = getattr(request_lock, "release", None)
+    if callable(release):
+        release()
