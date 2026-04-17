@@ -124,6 +124,71 @@ def test_invalid_json_returns_400(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     assert response.json()["detail"] == "Request body must be valid JSON"
 
 
+def test_v1_models_lists_only_priced_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+    monkeypatch.setenv("B_KEY", "b")
+
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "group", "name": "default"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "pricing": {
+                        "models": {
+                            "gpt-5.4": {
+                                "input_per_million_tokens_usd": 2.5,
+                                "output_per_million_tokens_usd": 15.0,
+                            },
+                            "gpt-5.4-mini": {
+                                "input_per_million_tokens_usd": 0.75,
+                                "output_per_million_tokens_usd": 4.5,
+                            },
+                        }
+                    },
+                },
+                {
+                    "name": "b",
+                    "protocol": "anthropic",
+                    "base_url": "https://api.anthropic.com",
+                    "api_key_env": "B_KEY",
+                    "pricing": {
+                        "models": {
+                            "claude-sonnet-4-6": {
+                                "input_per_million_tokens_usd": 3.0,
+                                "output_per_million_tokens_usd": 15.0,
+                            }
+                        }
+                    },
+                },
+            ],
+            "provider_groups": [{"name": "default", "strategy": "fallback", "members": ["a", "b"]}],
+        }
+    )
+    client = TestClient(
+        create_app(
+            config, SQLiteConversationStore(tmp_path / "models.db"), ProviderDispatcher(config)
+        )
+    )
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "object": "list",
+        "data": [
+            {"id": "claude-sonnet-4-6", "object": "model", "created": 0, "owned_by": "llmpxy"},
+            {"id": "gpt-5.4", "object": "model", "created": 0, "owned_by": "llmpxy"},
+            {"id": "gpt-5.4-mini", "object": "model", "created": 0, "owned_by": "llmpxy"},
+        ],
+    }
+
+
 def test_oairesp_stream_prefers_native_protocol_provider(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

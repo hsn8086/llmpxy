@@ -74,6 +74,10 @@ def create_app(
     async def readyz() -> dict[str, str]:
         return {"status": "ready"}
 
+    @app.get("/v1/models")
+    async def list_models() -> dict[str, object]:
+        return _build_models_response(dispatcher.resolve_route_provider_order())
+
     @app.post("/v1/responses")
     async def oai_responses(request: Request) -> Response:
         return await _handle_protocol_request(request, config, store, dispatcher, "oairesp")
@@ -152,6 +156,16 @@ def create_runtime_managed_app(runtime: RuntimeManager) -> FastAPI:
     async def readyz() -> dict[str, str]:
         runtime.current()
         return {"status": "ready"}
+
+    @app.get("/v1/models")
+    async def list_models(request: Request) -> dict[str, object]:
+        api_key = runtime.authenticate(
+            request.headers.get("Authorization"), request.headers.get("x-api-key")
+        )
+        state = runtime.current()
+        provider_order = state.dispatcher.resolve_route_provider_order()
+        selectable = runtime.selectable_provider_configs(api_key, provider_order)
+        return _build_models_response(selectable)
 
     @app.post("/v1/responses")
     async def oai_responses(request: Request) -> Response:
@@ -469,25 +483,24 @@ async def _handle_protocol_request_with_api_key(
                 request_id=request_id,
                 providers=prioritized_providers,
             )
-            with runtime.budget_guard(api_key, provider.name):
-                if inbound_protocol == "oairesp":
-                    _save_conversation(
-                        store,
-                        adapter.format_response(response),
-                        response.model,
-                        response.output_messages,
-                        canonical_request.metadata,
-                        config.storage.ttl_seconds,
-                    )
-                runtime.record_usage(
-                    api_key=api_key,
-                    request_id=request_id,
-                    started_at=started_at,
-                    request=canonical_request,
-                    response=response,
-                    provider_name=provider.name,
-                    latency_ms=int((time.perf_counter() - started_perf) * 1000),
+            if inbound_protocol == "oairesp":
+                _save_conversation(
+                    store,
+                    adapter.format_response(response),
+                    response.model,
+                    response.output_messages,
+                    canonical_request.metadata,
+                    config.storage.ttl_seconds,
                 )
+            runtime.record_usage(
+                api_key=api_key,
+                request_id=request_id,
+                started_at=started_at,
+                request=canonical_request,
+                response=response,
+                provider_name=provider.name,
+                latency_ms=int((time.perf_counter() - started_perf) * 1000),
+            )
             await runtime.publish_request_event(
                 {
                     "request_id": request_id,
@@ -508,16 +521,15 @@ async def _handle_protocol_request_with_api_key(
             request_id=request_id,
             providers=prioritized_providers,
         )
-        with runtime.budget_guard(api_key, provider.name):
-            runtime.record_usage(
-                api_key=api_key,
-                request_id=request_id,
-                started_at=started_at,
-                request=canonical_request,
-                response=response,
-                provider_name=provider.name,
-                latency_ms=int((time.perf_counter() - started_perf) * 1000),
-            )
+        runtime.record_usage(
+            api_key=api_key,
+            request_id=request_id,
+            started_at=started_at,
+            request=canonical_request,
+            response=response,
+            provider_name=provider.name,
+            latency_ms=int((time.perf_counter() - started_perf) * 1000),
+        )
         await runtime.publish_request_event(
             {
                 "request_id": request_id,
@@ -1865,3 +1877,21 @@ def _release_request_lock(request_lock: Any) -> None:
     release = getattr(request_lock, "release", None)
     if callable(release):
         release()
+
+
+def _build_models_response(providers: list[ProviderConfig]) -> dict[str, object]:
+    model_ids: set[str] = set()
+    for provider in providers:
+        model_ids.update(provider.pricing.models)
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "llmpxy",
+            }
+            for model_id in sorted(model_ids)
+        ],
+    }

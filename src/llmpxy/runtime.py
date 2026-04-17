@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import hashlib
 import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -42,8 +41,6 @@ class RuntimeManager:
     def __init__(self, config_path: Path) -> None:
         self._config_path = config_path.resolve()
         self._lock = threading.RLock()
-        self._budget_lock_guard = threading.Lock()
-        self._budget_locks: dict[str, threading.RLock] = {}
         self._stats = RuntimeStats()
         self._state = self._load_state()
 
@@ -160,17 +157,6 @@ class RuntimeManager:
         )
         self._log_post_request_limit_state(api_key, provider_name, state, request_id)
         return cost
-
-    @contextmanager
-    def budget_guard(self, api_key: AuthenticatedApiKey, provider_name: str):
-        budget_lock = self._budget_lock_for(api_key.uuid)
-        with budget_lock:
-            state = self.current()
-            self._ensure_within_limits(api_key, provider_name, state)
-            yield state
-
-    def api_key_lock(self, api_key_uuid: str) -> threading.RLock:
-        return self._budget_lock_for(api_key_uuid)
 
     async def publish_request_event(self, payload: dict[str, object]) -> None:
         await self._stats.publish("request", payload)
@@ -473,14 +459,6 @@ class RuntimeManager:
         self._stats.reload.last_success_at = int(time.time())
         self._stats.reload.last_error = None
         bind_logger().info("config reloaded path={}", str(self._config_path))
-
-    def _budget_lock_for(self, api_key_uuid: str) -> threading.RLock:
-        with self._budget_lock_guard:
-            budget_lock = self._budget_locks.get(api_key_uuid)
-            if budget_lock is None:
-                budget_lock = threading.RLock()
-                self._budget_locks[api_key_uuid] = budget_lock
-            return budget_lock
 
     def _load_state(self) -> RuntimeState:
         config = load_config(self._config_path)

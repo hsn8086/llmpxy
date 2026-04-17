@@ -157,6 +157,57 @@ output_per_million_tokens_usd = 1.0
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
+def test_managed_app_v1_models_requires_api_key_and_lists_priced_models(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("UPSTREAM_A_KEY", "upstream-a")
+
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[admin]
+enabled = true
+token = "admin-token"
+
+[route]
+type = "provider"
+name = "provider-a"
+
+[[api_keys]]
+uuid = "11111111-1111-1111-1111-111111111111"
+name = "client-a"
+key = "client-a"
+limit_usd = 10.0
+
+[[providers]]
+name = "provider-a"
+protocol = "oaichat"
+base_url = "https://a.example/v1"
+api_key_env = "UPSTREAM_A_KEY"
+model_whitelist_only = true
+
+[providers.pricing.models."gpt-5.4"]
+input_per_million_tokens_usd = 2.5
+output_per_million_tokens_usd = 15.0
+
+[providers.pricing.models."gpt-5.4-mini"]
+input_per_million_tokens_usd = 0.75
+output_per_million_tokens_usd = 4.5
+""",
+        encoding="utf-8",
+    )
+
+    client = TestClient(create_runtime_managed_app(RuntimeManager(config_file)))
+
+    unauthorized = client.get("/v1/models")
+    assert unauthorized.status_code == 401
+
+    response = client.get("/v1/models", headers={"Authorization": "Bearer client-a"})
+    assert response.status_code == 200
+    assert response.json()["object"] == "list"
+    assert [item["id"] for item in response.json()["data"]] == ["gpt-5.4", "gpt-5.4-mini"]
+
+
 def test_managed_app_admin_endpoints_require_admin_token(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("UPSTREAM_A_KEY", "upstream-a")
     config_file = tmp_path / "config.toml"
