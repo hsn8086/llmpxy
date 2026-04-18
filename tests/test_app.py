@@ -2560,6 +2560,69 @@ def test_oairesp_stream_preserves_reasoning_from_native_responses_events(
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
+def test_oaichat_bridge_oairesp_stream_emits_reasoning_summary_events(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="\n\n".join(
+                [
+                    'data: {"id":"chatcmpl_1","model":"a-model","choices":[{"delta":{"reasoning_content":"bridge reasoning summary","content":"final answer"}}]}',
+                    "data: [DONE]",
+                ]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oaichat",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "a-model"},
+                }
+            ],
+        }
+    )
+    client = TestClient(
+        create_app(
+            config,
+            SQLiteConversationStore(tmp_path / "bridge-reasoning.db"),
+            ProviderDispatcher(config),
+        )
+    )
+
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={"model": "gpt-5.4", "stream": True, "input": "hi", "reasoning": {"effort": "high"}},
+    ) as response:
+        assert response.status_code == 200
+        output = "".join(response.iter_text())
+
+    assert "response.reasoning_summary_part.added" in output
+    assert "response.reasoning_summary_text.delta" in output
+    assert "bridge reasoning summary" in output
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
 def test_oairesp_accepts_function_call_output_items(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

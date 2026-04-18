@@ -261,6 +261,7 @@ class ResponseStreamFormatterState:
     final_text_parts: list[str] = field(default_factory=list)
     sequence_number: int = 0
     message_id: str = field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
+    reasoning_id: str = field(default_factory=lambda: f"rs_{uuid.uuid4().hex}")
     message_output_index: int = 0
     message_opened: bool = False
     completed_item: dict[str, Any] | None = None
@@ -632,6 +633,7 @@ def finalize_response_stream(state: ResponseStreamFormatterState) -> list[str]:
             reasoning_text,
             include_encrypted_content=_wants_reasoning_encrypted_content(state.response),
         )
+        reasoning_item["id"] = state.reasoning_id
     tool_calls = _extract_response_tool_calls(state.response)
     if tool_calls:
         state.message_output_index = len(tool_calls) + (1 if reasoning_item is not None else 0)
@@ -719,6 +721,50 @@ def finalize_response_stream(state: ResponseStreamFormatterState) -> list[str]:
             "sequence_number": state.sequence_number,
             "output_index": len(tool_calls),
             "item": reasoning_item,
+        }
+        _log_stream_event(event)
+        emitted.append(f"data: {json.dumps(event)}\n\n")
+        state.sequence_number += 1
+        event = {
+            "type": "response.reasoning_summary_part.added",
+            "sequence_number": state.sequence_number,
+            "output_index": len(tool_calls),
+            "item_id": state.reasoning_id,
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": ""},
+        }
+        _log_stream_event(event)
+        emitted.append(f"data: {json.dumps(event)}\n\n")
+        state.sequence_number += 1
+        event = {
+            "type": "response.reasoning_summary_text.delta",
+            "sequence_number": state.sequence_number,
+            "output_index": len(tool_calls),
+            "item_id": state.reasoning_id,
+            "summary_index": 0,
+            "delta": reasoning_text,
+        }
+        _log_stream_event(event)
+        emitted.append(f"data: {json.dumps(event)}\n\n")
+        state.sequence_number += 1
+        event = {
+            "type": "response.reasoning_summary_text.done",
+            "sequence_number": state.sequence_number,
+            "output_index": len(tool_calls),
+            "item_id": state.reasoning_id,
+            "summary_index": 0,
+            "text": reasoning_text,
+        }
+        _log_stream_event(event)
+        emitted.append(f"data: {json.dumps(event)}\n\n")
+        state.sequence_number += 1
+        event = {
+            "type": "response.reasoning_summary_part.done",
+            "sequence_number": state.sequence_number,
+            "output_index": len(tool_calls),
+            "item_id": state.reasoning_id,
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": reasoning_text},
         }
         _log_stream_event(event)
         emitted.append(f"data: {json.dumps(event)}\n\n")
