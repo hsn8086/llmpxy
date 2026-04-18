@@ -9,7 +9,12 @@ from typing import Any, cast
 import pytest
 from fastapi.testclient import TestClient
 
-from llmpxy.app import _prepare_live_stream_bridge, _prepare_live_stream_passthrough, create_app
+from llmpxy.app import (
+    _prepare_live_stream_bridge,
+    _prepare_live_stream_passthrough,
+    _stream_with_heartbeat,
+    create_app,
+)
 from llmpxy.config import AppConfig
 from llmpxy.dispatcher import ProviderDispatcher
 from llmpxy.models import CanonicalResponse, CanonicalUsage
@@ -103,6 +108,28 @@ def test_root_and_v1_return_base_url_hint(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert root_response.text == expected
     assert v1_response.status_code == 200
     assert v1_response.text == expected
+
+
+@pytest.mark.asyncio
+async def test_stream_with_heartbeat_emits_keepalive_between_chunks() -> None:
+    async def source() -> AsyncIterator[str]:
+        yield "data: first\n\n"
+        await asyncio.sleep(0.02)
+        yield "data: second\n\n"
+
+    import llmpxy.app as app_module
+
+    original = app_module._STREAM_HEARTBEAT_SECONDS
+    app_module._STREAM_HEARTBEAT_SECONDS = 0.005
+    try:
+        chunks = [chunk async for chunk in _stream_with_heartbeat(source())]
+    finally:
+        app_module._STREAM_HEARTBEAT_SECONDS = original
+
+    assert chunks[0] == "data: first\n\n"
+    assert ": keepalive\n\n" in chunks
+    assert "data: second\n\n" in chunks
+    assert chunks.index("data: first\n\n") < chunks.index("data: second\n\n")
 
 
 def test_invalid_json_returns_400(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

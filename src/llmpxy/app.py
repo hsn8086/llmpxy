@@ -54,6 +54,7 @@ from llmpxy.storage import ConversationStore
 _BASE_URL_HINT = (
     "Oops! 这是base_url, 无法用浏览器访问哦, 如果你不知道怎么做的话...让codex/claude code教你吧!"
 )
+_STREAM_HEARTBEAT_SECONDS = 15.0
 
 
 def create_app(
@@ -281,36 +282,40 @@ async def _handle_protocol_request(
             )
             if _can_bridge_live_stream(inbound_protocol, route_providers):
                 return StreamingResponse(
-                    await _prepare_live_stream_bridge(
-                        inbound_protocol=inbound_protocol,
-                        request_id=request_id,
-                        canonical_request=canonical_request,
-                        providers=route_providers,
-                        adapter=adapter,
-                        runtime=None,
-                        api_key=None,
-                        store=store,
-                        config=config,
-                        started_at=started_at,
-                        started_perf=started_perf,
+                    _stream_with_heartbeat(
+                        await _prepare_live_stream_bridge(
+                            inbound_protocol=inbound_protocol,
+                            request_id=request_id,
+                            canonical_request=canonical_request,
+                            providers=route_providers,
+                            adapter=adapter,
+                            runtime=None,
+                            api_key=None,
+                            store=store,
+                            config=config,
+                            started_at=started_at,
+                            started_perf=started_perf,
+                        )
                     ),
                     media_type=_stream_media_type(inbound_protocol),
                     headers=_stream_headers(),
                 )
             if _can_passthrough_live_stream(inbound_protocol, route_providers):
                 return StreamingResponse(
-                    await _prepare_live_stream_passthrough(
-                        inbound_protocol=inbound_protocol,
-                        request_id=request_id,
-                        canonical_request=canonical_request,
-                        providers=route_providers,
-                        adapter=adapter,
-                        runtime=None,
-                        api_key=None,
-                        store=store,
-                        config=config,
-                        started_at=started_at,
-                        started_perf=started_perf,
+                    _stream_with_heartbeat(
+                        await _prepare_live_stream_passthrough(
+                            inbound_protocol=inbound_protocol,
+                            request_id=request_id,
+                            canonical_request=canonical_request,
+                            providers=route_providers,
+                            adapter=adapter,
+                            runtime=None,
+                            api_key=None,
+                            store=store,
+                            config=config,
+                            started_at=started_at,
+                            started_perf=started_perf,
+                        )
                     ),
                     media_type=_stream_media_type(inbound_protocol),
                     headers=_stream_headers(),
@@ -336,7 +341,7 @@ async def _handle_protocol_request(
                 response.model,
             )
             return StreamingResponse(
-                adapter.format_stream(response, events),
+                _stream_with_heartbeat(adapter.format_stream(response, events)),
                 media_type=_stream_media_type(inbound_protocol),
                 headers=_stream_headers(),
             )
@@ -444,36 +449,40 @@ async def _handle_protocol_request_with_api_key(
         if canonical_request.stream:
             if _can_bridge_live_stream(inbound_protocol, prioritized_providers):
                 return StreamingResponse(
-                    await _prepare_live_stream_bridge(
-                        inbound_protocol=inbound_protocol,
-                        request_id=request_id,
-                        canonical_request=canonical_request,
-                        providers=prioritized_providers,
-                        adapter=adapter,
-                        runtime=runtime,
-                        api_key=api_key,
-                        store=store,
-                        config=config,
-                        started_at=started_at,
-                        started_perf=started_perf,
+                    _stream_with_heartbeat(
+                        await _prepare_live_stream_bridge(
+                            inbound_protocol=inbound_protocol,
+                            request_id=request_id,
+                            canonical_request=canonical_request,
+                            providers=prioritized_providers,
+                            adapter=adapter,
+                            runtime=runtime,
+                            api_key=api_key,
+                            store=store,
+                            config=config,
+                            started_at=started_at,
+                            started_perf=started_perf,
+                        )
                     ),
                     media_type=_stream_media_type(inbound_protocol),
                     headers=_stream_headers(),
                 )
             if _can_passthrough_live_stream(inbound_protocol, prioritized_providers):
                 return StreamingResponse(
-                    await _prepare_live_stream_passthrough(
-                        inbound_protocol=inbound_protocol,
-                        request_id=request_id,
-                        canonical_request=canonical_request,
-                        providers=prioritized_providers,
-                        adapter=adapter,
-                        runtime=runtime,
-                        api_key=api_key,
-                        store=store,
-                        config=config,
-                        started_at=started_at,
-                        started_perf=started_perf,
+                    _stream_with_heartbeat(
+                        await _prepare_live_stream_passthrough(
+                            inbound_protocol=inbound_protocol,
+                            request_id=request_id,
+                            canonical_request=canonical_request,
+                            providers=prioritized_providers,
+                            adapter=adapter,
+                            runtime=runtime,
+                            api_key=api_key,
+                            store=store,
+                            config=config,
+                            started_at=started_at,
+                            started_perf=started_perf,
+                        )
                     ),
                     media_type=_stream_media_type(inbound_protocol),
                     headers=_stream_headers(),
@@ -511,7 +520,7 @@ async def _handle_protocol_request_with_api_key(
                 }
             )
             return StreamingResponse(
-                adapter.format_stream(response, events),
+                _stream_with_heartbeat(adapter.format_stream(response, events)),
                 media_type=_stream_media_type(inbound_protocol),
                 headers=_stream_headers(),
             )
@@ -698,6 +707,30 @@ def _stream_headers() -> dict[str, str]:
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
     }
+
+
+async def _stream_with_heartbeat(chunks: AsyncIterator[str]) -> AsyncIterator[str]:
+    iterator = chunks.__aiter__()
+    next_chunk_task: asyncio.Task[str] | None = None
+    while True:
+        if next_chunk_task is None:
+            next_chunk_task = asyncio.create_task(_next_stream_chunk(iterator))
+        try:
+            done, _pending = await asyncio.wait(
+                {next_chunk_task}, timeout=_STREAM_HEARTBEAT_SECONDS
+            )
+            if not done:
+                yield ": keepalive\n\n"
+                continue
+            chunk = next_chunk_task.result()
+            next_chunk_task = None
+        except StopAsyncIteration:
+            break
+        yield chunk
+
+
+async def _next_stream_chunk(iterator: AsyncIterator[str]) -> str:
+    return await iterator.__anext__()
 
 
 def _record_live_provider_attempt(runtime: RuntimeManager | None, provider_name: str) -> None:
