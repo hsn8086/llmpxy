@@ -151,7 +151,14 @@ class OpenAIResponsesAdapter:
                     output_tokens=int(usage_payload.get("output_tokens", 0)),
                     total_tokens=int(usage_payload.get("total_tokens", 0)),
                 ),
-                metadata=_normalize_metadata(payload.get("metadata")),
+                metadata={
+                    **_normalize_metadata(payload.get("metadata")),
+                    **(
+                        {"_response_reasoning": dict(payload["reasoning"])}
+                        if isinstance(payload.get("reasoning"), dict)
+                        else {}
+                    ),
+                },
                 raw_response=payload,
             )
         return self._chat_adapter.parse_response(payload, protocol_out)
@@ -216,6 +223,11 @@ class OpenAIResponsesAdapter:
             "created_at": response.created_at,
             "status": response.status,
             "model": response.model,
+            **(
+                {"reasoning": response.metadata["_response_reasoning"]}
+                if isinstance(response.metadata.get("_response_reasoning"), dict)
+                else {}
+            ),
             "output": output_items,
             "parallel_tool_calls": False,
             "tool_choice": "auto",
@@ -272,6 +284,11 @@ def init_response_stream_formatter_state(
             "created_at": response.created_at,
             "status": "in_progress",
             "model": response.model,
+            **(
+                {"reasoning": response.metadata["_response_reasoning"]}
+                if isinstance(response.metadata.get("_response_reasoning"), dict)
+                else {}
+            ),
             "output": [],
             "parallel_tool_calls": False,
             "tool_choice": "auto",
@@ -311,6 +328,8 @@ class ResponsesStreamState:
     item_id: str = field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
     model: str = ""
     text_parts: list[str] = field(default_factory=list)
+    reasoning_parts: list[str] = field(default_factory=list)
+    response_reasoning: dict[str, Any] | None = None
     usage: CanonicalUsage = field(default_factory=CanonicalUsage)
     events: list[CanonicalStreamEvent] = field(default_factory=list)
     tool_calls_by_item_id: dict[str, CanonicalToolCall] = field(default_factory=dict)
@@ -347,6 +366,10 @@ async def process_responses_stream_line(
             and isinstance(response_payload.get("model"), str)
         ):
             state.model = response_payload["model"]
+        if isinstance(response_payload, dict) and isinstance(
+            response_payload.get("reasoning"), dict
+        ):
+            state.response_reasoning = dict(response_payload["reasoning"])
         if response_event_type == "response.output_text.delta" and isinstance(
             payload.get("delta"), str
         ):
@@ -359,6 +382,17 @@ async def process_responses_stream_line(
             )
             state.events.append(event)
             emitted.append(event)
+        elif response_event_type in {
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+        } and isinstance(payload.get("delta"), str):
+            state.reasoning_parts.append(payload["delta"])
+        elif response_event_type in {
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_part.done",
+        }:
+            pass
         elif response_event_type == "response.function_call_arguments.delta" and isinstance(
             payload.get("item_id"), str
         ):
@@ -407,6 +441,10 @@ async def process_responses_stream_line(
                         tool_call.name = item_payload["name"]
                     if isinstance(item_payload.get("arguments"), str):
                         tool_call.arguments = item_payload["arguments"]
+            elif item_payload.get("type") == "reasoning":
+                for part in item_payload.get("summary", []):
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        state.reasoning_parts.append(part["text"])
         completed = response_payload
         if isinstance(completed, dict) and isinstance(completed.get("usage"), dict):
             state.usage = CanonicalUsage(
@@ -429,7 +467,12 @@ async def process_responses_stream_line(
     state.response_id = chat_response.response_id
     state.model = chat_response.model
     state.usage = chat_response.usage
-    state.text_parts = [part.text or "" for part in chat_response.output_messages[0].content]
+    if chat_response.output_messages:
+        state.text_parts = [part.text or "" for part in chat_response.output_messages[0].content]
+    if chat_response.output_messages:
+        reasoning_content = chat_response.output_messages[0].reasoning_content
+        if isinstance(reasoning_content, str) and reasoning_content:
+            state.reasoning_parts.append(reasoning_content)
     state.events.extend(chat_events)
     emitted.extend(chat_events)
     return emitted
@@ -448,9 +491,15 @@ def build_responses_stream_result(
                 role="assistant",
                 content=[CanonicalContentPart(type="text", text="".join(state.text_parts))],
                 tool_calls=state.tool_calls_in_order,
+                reasoning_content="".join(state.reasoning_parts) or None,
             )
         ],
         usage=state.usage,
+        metadata=(
+            {"_response_reasoning": state.response_reasoning}
+            if state.response_reasoning is not None
+            else {}
+        ),
     )
     return response, state.events
 
@@ -736,6 +785,11 @@ def finalize_response_stream(state: ResponseStreamFormatterState) -> list[str]:
         "created_at": state.response.created_at,
         "status": "completed",
         "model": state.response.model,
+        **(
+            {"reasoning": state.response.metadata["_response_reasoning"]}
+            if isinstance(state.response.metadata.get("_response_reasoning"), dict)
+            else {}
+        ),
         "output": [
             *[
                 {

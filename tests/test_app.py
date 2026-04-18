@@ -2487,6 +2487,79 @@ def test_oairesp_stream_history_function_calls_use_fc_item_ids(
     monkeypatch.setattr(httpx, "AsyncClient", original)
 
 
+def test_oairesp_stream_preserves_reasoning_from_native_responses_events(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("A_KEY", "a")
+
+    import httpx
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="\n\n".join(
+                [
+                    'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.4","reasoning":{"effort":"high","summary":"detailed"}}}',
+                    'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","delta":"first part "}',
+                    'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","delta":"second part"}',
+                    'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"final answer"}',
+                    (
+                        "event: response.completed\n"
+                        'data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","status":"completed","reasoning":{"effort":"high","summary":"detailed"},"output":[{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"first part second part"}]},{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"final answer"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}'
+                    ),
+                ]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    original = httpx.AsyncClient
+
+    class PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedAsyncClient)
+    config = AppConfig.model_validate(
+        {
+            "route": {"type": "provider", "name": "a"},
+            "providers": [
+                {
+                    "name": "a",
+                    "protocol": "oairesp",
+                    "base_url": "https://a.example/v1",
+                    "api_key_env": "A_KEY",
+                    "models": {"gpt-5.4": "gpt-5.4"},
+                }
+            ],
+        }
+    )
+    store = SQLiteConversationStore(tmp_path / "oairesp-native-reasoning-stream.db")
+    dispatcher = ProviderDispatcher(config)
+    app = create_app(config, store, dispatcher)
+    client = TestClient(app)
+
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={
+            "model": "gpt-5.4",
+            "stream": True,
+            "input": "hi",
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "include": ["reasoning.encrypted_content"],
+        },
+    ) as response:
+        assert response.status_code == 200
+        chunks = list(response.iter_text())
+
+    output = "".join(chunks)
+    assert '"reasoning": {"effort": "high", "summary": "detailed"}' in output
+    assert '"type": "reasoning"' in output
+    assert "first part second part" in output
+    monkeypatch.setattr(httpx, "AsyncClient", original)
+
+
 def test_oairesp_accepts_function_call_output_items(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
