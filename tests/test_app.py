@@ -2618,7 +2618,7 @@ def test_oaichat_bridge_oairesp_stream_emits_reasoning_summary_events(
         output = "".join(response.iter_text())
 
     assert "response.reasoning_summary_part.added" in output
-    assert "response.reasoning_summary_text.delta" in output
+    assert output.count("response.reasoning_summary_text.delta") >= 1
     assert "bridge reasoning summary" in output
     monkeypatch.setattr(httpx, "AsyncClient", original)
 

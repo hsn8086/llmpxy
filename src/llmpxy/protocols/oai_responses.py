@@ -715,6 +715,7 @@ def finalize_response_stream(state: ResponseStreamFormatterState) -> list[str]:
         _log_stream_event(event)
         emitted.append(f"data: {json.dumps(event)}\n\n")
     if reasoning_item is not None:
+        reasoning_text_value = reasoning_text or ""
         state.sequence_number += 1
         event = {
             "type": "response.output_item.added",
@@ -735,17 +736,18 @@ def finalize_response_stream(state: ResponseStreamFormatterState) -> list[str]:
         }
         _log_stream_event(event)
         emitted.append(f"data: {json.dumps(event)}\n\n")
-        state.sequence_number += 1
-        event = {
-            "type": "response.reasoning_summary_text.delta",
-            "sequence_number": state.sequence_number,
-            "output_index": len(tool_calls),
-            "item_id": state.reasoning_id,
-            "summary_index": 0,
-            "delta": reasoning_text,
-        }
-        _log_stream_event(event)
-        emitted.append(f"data: {json.dumps(event)}\n\n")
+        for chunk in _chunk_reasoning_summary(reasoning_text_value):
+            state.sequence_number += 1
+            event = {
+                "type": "response.reasoning_summary_text.delta",
+                "sequence_number": state.sequence_number,
+                "output_index": len(tool_calls),
+                "item_id": state.reasoning_id,
+                "summary_index": 0,
+                "delta": chunk,
+            }
+            _log_stream_event(event)
+            emitted.append(f"data: {json.dumps(event)}\n\n")
         state.sequence_number += 1
         event = {
             "type": "response.reasoning_summary_text.done",
@@ -753,7 +755,7 @@ def finalize_response_stream(state: ResponseStreamFormatterState) -> list[str]:
             "output_index": len(tool_calls),
             "item_id": state.reasoning_id,
             "summary_index": 0,
-            "text": reasoning_text,
+            "text": reasoning_text_value,
         }
         _log_stream_event(event)
         emitted.append(f"data: {json.dumps(event)}\n\n")
@@ -764,7 +766,7 @@ def finalize_response_stream(state: ResponseStreamFormatterState) -> list[str]:
             "output_index": len(tool_calls),
             "item_id": state.reasoning_id,
             "summary_index": 0,
-            "part": {"type": "summary_text", "text": reasoning_text},
+            "part": {"type": "summary_text", "text": reasoning_text_value},
         }
         _log_stream_event(event)
         emitted.append(f"data: {json.dumps(event)}\n\n")
@@ -878,6 +880,22 @@ def _optional_float(value: Any) -> float | None:
     if not isinstance(value, int | float):
         raise HTTPException(status_code=400, detail="Expected numeric value")
     return float(value)
+
+
+def _chunk_reasoning_summary(text: str) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if current and len(current) + len(line) > 96:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current)
+    if not chunks:
+        return [text]
+    return chunks
 
 
 def _optional_int(value: Any) -> int | None:
