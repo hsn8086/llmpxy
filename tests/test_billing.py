@@ -70,6 +70,45 @@ def test_calculate_usage_cost_falls_back_to_input_price_without_cached_price() -
     assert cost.amount_usd == 6.0
 
 
+def test_calculate_usage_cost_inherits_default_cached_price_for_model_override() -> None:
+    provider = ProviderConfig.model_validate(
+        {
+            "name": "provider-a",
+            "protocol": "oaichat",
+            "base_url": "https://a.example/v1",
+            "api_key_env": "A_KEY",
+            "pricing": {
+                "default": {
+                    "input_per_million_tokens_usd": 2.5,
+                    "cached_input_per_million_tokens_usd": 0.25,
+                    "output_per_million_tokens_usd": 15.0,
+                },
+                "models": {
+                    "gpt-5.4": {
+                        "input_per_million_tokens_usd": 2.5,
+                        "output_per_million_tokens_usd": 15.0,
+                    }
+                },
+            },
+        }
+    )
+
+    cost = calculate_usage_cost(
+        provider,
+        requested_model="gpt-5.4",
+        upstream_model="gpt-5.4",
+        usage=CanonicalUsage(
+            input_tokens=387_792,
+            cached_input_tokens=387_456,
+            output_tokens=1_013,
+            total_tokens=388_805,
+        ),
+    )
+
+    assert cost.pricing_source == "gpt-5.4"
+    assert cost.amount_usd == 0.112899
+
+
 def test_oairesp_parse_response_reads_cached_input_tokens() -> None:
     adapter = OpenAIResponsesAdapter()
 

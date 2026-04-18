@@ -103,6 +103,16 @@ class ProviderConfig(BaseModel):
                 continue
             pricing = self.pricing.models.get(model_name)
             if pricing is not None:
+                if (
+                    pricing.cached_input_per_million_tokens_usd is None
+                    and self.pricing.default is not None
+                    and self.pricing.default.cached_input_per_million_tokens_usd is not None
+                ):
+                    return pricing.model_copy(
+                        update={
+                            "cached_input_per_million_tokens_usd": self.pricing.default.cached_input_per_million_tokens_usd
+                        }
+                    )
                 return pricing
         return self.pricing.default
 
